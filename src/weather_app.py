@@ -1,1819 +1,2375 @@
-#!/usr/bin/env python3
-"""
-Stealth Weather Pro
-===================
-A polished desktop weather app (Open-Meteo, no API key) with a private vault for
-actual imported files and folders. Vault metadata is encrypted; imported files are stored locally.
-
-Install:
-    pip install customtkinter requests Pillow cryptography
-
-Run:
-    python stealth_weather_pro.py
-
-How it works
-------------
-* First launch: you create your own secret access code (nothing is hard-coded).
-  Only a salted PBKDF2-SHA256 verifier is stored, never the code itself.
-* Typing the exact code into the city search box and pressing Enter (or Search)
-  opens the vault. The check happens locally BEFORE any network call.
-* Anything else is a normal city search ("Location not found" if no match).
-* The vault metadata is Fernet-encrypted with a key derived from your code.
-  Imported files and folders are copied as real local items under saved_items;
-  those copies are ordinary files, while their metadata remains encrypted.
-
-Access-code rules (and why):
-* At least 6 characters.
-* Must START with a digit or symbol (e.g. "#Moon4721"). City names start with a
-  letter, so the app never sends anything that starts with a non-letter to the
-  autocomplete service. That keeps your code from leaking to a third party while
-  you type it.
-
-Forgot your code? There is no recovery by design. Delete the folder
-~/.wx_pro (or set WX_PRO_HOME to relocate it) to reset; the vault is lost.
-"""
-
-from __future__ import annotations
-
-import base64
-import hashlib
-import hmac
-import json
-import math
-import os
-import platform
-import queue
-import subprocess
-import shutil
-import sys
-import threading
-import time
-import traceback
-import uuid
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, simpledialog
-import tkinter.font as tkfont
-
-try:
-    import customtkinter as ctk
-    import requests
-    from cryptography.fernet import Fernet, InvalidToken
-except ImportError as exc:  # pragma: no cover
-    sys.exit(
-        f"Missing dependency: {exc.name}\n"
-        "Install everything with:\n"
-        "    pip install customtkinter requests Pillow cryptography"
-    )
-
-try:
-    from PIL import Image, ImageDraw, ImageTk
-except ImportError:  # icon is optional
-    Image = None
-
-# ----------------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------------
-APP_DIR = Path(os.environ.get("WX_PRO_HOME", Path.home() / ".wx_pro"))
-CONFIG_PATH = APP_DIR / ".config.json"
-VAULT_PATH = APP_DIR / "forecast_cache.bin"  # encrypted vault metadata
-SAVED_ITEMS_DIR = APP_DIR / "saved_items"  # actual imported file and folder copies
-
-PBKDF2_ITERS = 300_000
-IDLE_LOCK_MS = 5 * 60 * 1000       # vault auto-locks after 5 idle minutes
-REFRESH_MS = 10 * 60 * 1000        # weather auto-refresh
-GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-
-WHITE = "#FFFFFF"
-MUTED = "#CFD8E6"
-
-# Vault palette
-V_BG, V_CARD, V_LINE = "#0F1218", "#171B24", "#262C3A"
-V_TEXT, V_MUTED = "#E8ECF4", "#8B94A7"
-V_ACCENT, V_DANGER = "#4C8DFF", "#E5484D"
-
-
-# ----------------------------------------------------------------------------
-# SMALL UTILITIES
-# ----------------------------------------------------------------------------
-def hex_to_rgb(h: str):
-    h = h.lstrip("#")
-    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
-
-
-def rgb_to_hex(rgb) -> str:
-    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in rgb)
-
-
-def mix(a: str, b: str, t: float) -> str:
-    ra, rb = hex_to_rgb(a), hex_to_rgb(b)
-    return rgb_to_hex(tuple(x + (y - x) * t for x, y in zip(ra, rb)))
-
-
-def ease(t: float) -> float:
-    return t * t * (3 - 2 * t)
-
-
-def font(size: int, weight: str = "normal") -> "ctk.CTkFont":
-    return ctk.CTkFont(size=size, weight=weight)
-
-
-def is_ctk(w) -> bool:
-    return hasattr(w, "_bg_color") and hasattr(w, "_apply_appearance_mode")
-
-
-def hide_on_windows(path: Path):
-    if os.name == "nt":
-        try:
-            import ctypes
-            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)
-        except Exception:
-            pass
-
-
-def atomic_write(path: Path, data: bytes):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
-
-
-def reveal_in_file_manager(path: str) -> str | None:
-    """Open Explorer/Finder/file manager at `path`. Returns a note if a fallback was used."""
-    p = Path(path)
-    note = None
-    target = p
-    if not p.exists():
-        parent = next((a for a in p.parents if a.exists()), None)
-        if parent is None:
-            raise FileNotFoundError("Neither the item nor any parent folder exists.")
-        target, note = parent, "Item not found; opened the nearest existing folder."
-    system = platform.system()
-    if system == "Windows":
-        if target.is_dir():
-            os.startfile(str(target))  # type: ignore[attr-defined]
-        else:
-            subprocess.Popen(["explorer", f"/select,{target}"])
-    elif system == "Darwin":
-        subprocess.Popen(["open", "-R", str(target)] if target.is_file() else ["open", str(target)])
-    else:
-        subprocess.Popen(["xdg-open", str(target if target.is_dir() else target.parent)])
-    return note
-
-
-# ----------------------------------------------------------------------------
-# SECURITY: PIN hashing + encrypted vault
-# ----------------------------------------------------------------------------
-def validate_pin(pin: str, confirm: str | None = None) -> str | None:
-    if len(pin) < 6:
-        return "Use at least 6 characters."
-    if pin != pin.strip():
-        return "No spaces at the start or end."
-    if pin[0].isalpha():
-        return "Must start with a digit or symbol (e.g. #Moon4721)."
-    if confirm is not None and pin != confirm:
-        return "The two codes don't match."
-    return None
-
-
-class Security:
-    """Stores a salted PBKDF2 verifier plus non-sensitive prefs in .config.json."""
-
-    def __init__(self):
-        self.cfg: dict = {}
-
-    @property
-    def configured(self) -> bool:
-        return "verifier" in self.cfg
-
-    def load(self):
-        try:
-            self.cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            self.cfg = {}
-
-    def save(self):
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        hide_on_windows(APP_DIR)
-        atomic_write(CONFIG_PATH, json.dumps(self.cfg).encode("utf-8"))
-
-    @staticmethod
-    def derive(pin: str, salt: bytes, iters: int) -> bytes:
-        return hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, iters, 32)
-
-    @staticmethod
-    def verifier(key: bytes) -> str:
-        return hashlib.sha256(b"wx-verify" + key).hexdigest()
-
-    def set_pin(self, pin: str) -> bytes:
-        salt = os.urandom(16)
-        key = self.derive(pin, salt, PBKDF2_ITERS)
-        self.cfg.update(
-            v=1,
-            salt=base64.b64encode(salt).decode(),
-            iters=PBKDF2_ITERS,
-            verifier=self.verifier(key),
-        )
-        self.save()
-        return key
-
-    def check_pin(self, pin: str) -> bytes | None:
-        if not self.configured:
-            return None
-        try:
-            salt = base64.b64decode(self.cfg["salt"])
-            key = self.derive(pin, salt, int(self.cfg["iters"]))
-        except Exception:
-            return None
-        if hmac.compare_digest(self.verifier(key), self.cfg["verifier"]):
-            return key
-        return None
-
-    def update_prefs(self, **kw):
-        self.cfg.update(kw)
-        if self.configured:
-            self.save()
-
-
-class Vault:
-    """Encrypted metadata for real file and folder copies managed by this app."""
-
-    def __init__(self, key: bytes):
-        self.key = key
-        self.entries: list[dict] = []
-        self._load()
-
-    def _fernet(self) -> Fernet:
-        return Fernet(base64.urlsafe_b64encode(self.key))
-
-    def _load(self):
-        if VAULT_PATH.exists():
-            plain = self._fernet().decrypt(VAULT_PATH.read_bytes())  # InvalidToken if wrong key
-            self.entries = json.loads(plain.decode("utf-8"))
-
-    def save(self):
-        blob = self._fernet().encrypt(json.dumps(self.entries).encode("utf-8"))
-        atomic_write(VAULT_PATH, blob)
-        hide_on_windows(VAULT_PATH)
-
-    def add_path(self, path: str) -> bool:
-        path = os.path.abspath(path)
-        if any(e["path"] == path for e in self.entries):
-            return False
-        self.entries.append(
-            {
-                "id": uuid.uuid4().hex[:12],
-                "name": os.path.basename(path.rstrip("\\/")) or path,
-                "path": path,
-                "kind": "folder" if os.path.isdir(path) else "file",
-                "added": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "tags": "",
-                "note": "",
-            }
-        )
-        self.save()
-        return True
-
-    def import_path(self, source: str) -> bool:
-        """Copy a selected file or whole folder into the app's managed storage."""
-        src = Path(source).resolve()
-        if not src.exists() or not (src.is_file() or src.is_dir()):
-            raise FileNotFoundError("Choose an existing file or folder.")
-        managed = SAVED_ITEMS_DIR.resolve()
-        if src == managed or managed in src.parents:
-            raise ValueError("That item is already inside the app's saved files folder.")
-        if any(e.get("source") == str(src) for e in self.entries):
-            return False
-
-        eid = uuid.uuid4().hex[:12]
-        item_dir = SAVED_ITEMS_DIR / eid
-        item_dir.mkdir(parents=True, exist_ok=False)
-        name = src.name or "Saved item"
-        target = item_dir / name
-        try:
-            if src.is_dir():
-                shutil.copytree(src, target, symlinks=True)
-                kind = "folder"
-            else:
-                shutil.copy2(src, target)
-                kind = "file"
-            entry = {
-                "id": eid, "name": name, "path": str(target.resolve()), "source": str(src),
-                "kind": kind, "added": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "tags": "", "note": "",
-            }
-            self.entries.append(entry)
-            try:
-                self.save()
-            except Exception:
-                self.entries = [e for e in self.entries if e.get("id") != eid]
-                raise
-            return True
-        except Exception:
-            shutil.rmtree(item_dir, ignore_errors=True)
-            raise
-
-    def get(self, eid: str) -> dict | None:
-        return next((e for e in self.entries if e["id"] == eid), None)
-
-    def update(self, eid: str, **fields):
-        e = self.get(eid)
-        if e:
-            e.update(fields)
-            self.save()
-
-    def remove(self, ids):
-        ids = set(ids)
-        removed = [e for e in self.entries if e["id"] in ids]
-        self.entries = [e for e in self.entries if e["id"] not in ids]
-        managed = SAVED_ITEMS_DIR.resolve()
-        for e in removed:
-            path = Path(e.get("path", ""))
-            try:
-                resolved = path.resolve()
-                if managed in resolved.parents and resolved.exists():
-                    shutil.rmtree(resolved.parent, ignore_errors=True)
-            except (OSError, RuntimeError):
-                pass
-        self.save()
-
-    def rekey(self, new_key: bytes):
-        self.key = new_key
-        self.save()
-
-
-# ----------------------------------------------------------------------------
-# WEATHER DATA (Open-Meteo)
-# ----------------------------------------------------------------------------
-class WeatherError(Exception):
-    pass
-
-
-@dataclass
-class Place:
-    name: str
-    admin: str
-    country: str
-    lat: float
-    lon: float
-    population: int = 0
-    feature: str = ""
-
-    @property
-    def label(self) -> str:
-        return ", ".join(p for p in (self.name, self.admin, self.country) if p)
-
-
-def http_get_json(url: str, params: dict) -> dict:
-    try:
-        r = requests.get(url, params=params, timeout=8, headers={"User-Agent": "StealthWeatherPro/1.0"})
-    except requests.exceptions.ConnectionError:
-        raise WeatherError("No internet connection. Check your network and try again.")
-    except requests.exceptions.Timeout:
-        raise WeatherError("The weather service took too long to respond.")
-    except requests.RequestException:
-        raise WeatherError("Couldn't reach the weather service.")
-    if r.status_code != 200:
-        raise WeatherError(f"Weather service error ({r.status_code}). Try again shortly.")
-    try:
-        return r.json()
-    except ValueError:
-        raise WeatherError("Received an unreadable response from the weather service.")
-
-
-def search_places(query: str, count: int = 6) -> list[Place]:
-    base, _, rest = query.partition(",")  # "Paris, France" -> search "Paris", rank by "france"
-    base, rest = base.strip(), rest.strip().lower()
-    data = http_get_json(
-        GEOCODE_URL,
-        {"name": base, "count": max(15, count * 3), "language": "en", "format": "json"},
-    )
-    out, seen = [], set()
-    for r in data.get("results") or []:
-        p = Place(r.get("name", ""), r.get("admin1") or r.get("admin2") or "", r.get("country") or "", r["latitude"], r["longitude"], int(r.get("population") or 0), r.get("feature_code") or "")
-        if p.label in seen:
-            continue
-        seen.add(p.label)
-        out.append(p)
-    # Rank exact and prefix matches first, then well-known populated places. A
-    # typed country/region after a comma is treated as a strong disambiguator.
-    query_lower = base.lower()
-    out.sort(key=lambda p: (
-        0 if p.name.lower() == query_lower else 1 if p.name.lower().startswith(query_lower) else 2,
-        0 if rest and rest in p.label.lower() else 1 if rest else 0,
-        -(p.population or 0), p.label.lower()
-    ))
-    return out[:count]
-
-
-# WMO weather codes -> (label, kind, emoji)
-def describe(code: int, is_day: bool = True):
-    table = {
-        0: ("Clear sky", "clear"), 1: ("Mainly clear", "clear"), 2: ("Partly cloudy", "clouds"),
-        3: ("Overcast", "clouds"), 45: ("Fog", "fog"), 48: ("Rime fog", "fog"),
-        51: ("Light drizzle", "rain"), 53: ("Drizzle", "rain"), 55: ("Heavy drizzle", "rain"),
-        56: ("Freezing drizzle", "rain"), 57: ("Freezing drizzle", "rain"),
-        61: ("Light rain", "rain"), 63: ("Rain", "rain"), 65: ("Heavy rain", "rain"),
-        66: ("Freezing rain", "rain"), 67: ("Freezing rain", "rain"),
-        71: ("Light snow", "snow"), 73: ("Snow", "snow"), 75: ("Heavy snow", "snow"),
-        77: ("Snow grains", "snow"), 80: ("Rain showers", "rain"), 81: ("Rain showers", "rain"),
-        82: ("Violent showers", "rain"), 85: ("Snow showers", "snow"), 86: ("Heavy snow showers", "snow"),
-        95: ("Thunderstorm", "storm"), 96: ("Thunderstorm, hail", "storm"), 99: ("Thunderstorm, hail", "storm"),
-    }
-    label, kind = table.get(code, ("Unknown", "clouds"))
-    emoji = {
-        "clear": "☀️" if is_day else "🌙",
-        "clouds": ("⛅" if code == 2 else "☁️") if is_day else "☁️",
-        "fog": "🌫️", "rain": "🌧️", "snow": "❄️", "storm": "⛈️",
-    }[kind]
-    return label, kind, emoji
-
-
-THEMES = {
-    ("clear", True): "#2E7BE0", ("clear", False): "#0E1633",
-    ("clouds", True): "#5A6F8A", ("clouds", False): "#1D2433",
-    ("rain", True): "#33475E", ("rain", False): "#18202C",
-    ("snow", True): "#7E96B0", ("snow", False): "#2A3547",
-    ("storm", True): "#2A2D45", ("storm", False): "#15162A",
-    ("fog", True): "#6A7683", ("fog", False): "#242A33",
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math' as math;
+
+import 'package:archive/archive.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
+
+const ink = Color(0xff091426);
+const panel = Color(0xff14243a);
+const panelLight = Color(0xff1b304b);
+const sky = Color(0xff83c8ff);
+const mint = Color(0xff8cf0d0);
+const muted = Color(0xffa8b8cc);
+
+void main() => runApp(const WeatherRoot());
+
+class WeatherRoot extends StatelessWidget {
+  const WeatherRoot({super.key});
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+    title: 'Skyline Weather',
+    debugShowCheckedModeBanner: false,
+    theme: ThemeData(
+      brightness: Brightness.dark,
+      scaffoldBackgroundColor: ink,
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: sky,
+        brightness: Brightness.dark,
+      ),
+      useMaterial3: true,
+      fontFamily: 'Roboto',
+    ),
+    home: const WeatherHome(),
+  );
 }
 
+class Place {
+  const Place(this.name, this.region, this.country, this.lat, this.lon);
+  final String name, region, country;
+  final double lat, lon;
+  String get label => [
+    name,
+    if (region.isNotEmpty) region,
+    if (country.isNotEmpty) country,
+  ].join(', ');
+  Map<String, dynamic> toJson() => {
+    'name': name,
+    'region': region,
+    'country': country,
+    'lat': lat,
+    'lon': lon,
+  };
+  factory Place.fromJson(Map<String, dynamic> j) => Place(
+    j['name'] ?? 'Saved location',
+    j['region'] ?? '',
+    j['country'] ?? '',
+    (j['lat'] as num).toDouble(),
+    (j['lon'] as num).toDouble(),
+  );
+}
 
-def fetch_forecast(place: Place, units: str) -> dict:
-    metric = units == "metric"
-    j = http_get_json(
-        FORECAST_URL,
-        {
-            "latitude": place.lat, "longitude": place.lon, "timezone": "auto", "forecast_days": 7,
-            "temperature_unit": "celsius" if metric else "fahrenheit",
-            "wind_speed_unit": "kmh" if metric else "mph",
-            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,is_day,weather_code,"
-                       "wind_speed_10m,wind_direction_10m",
-            "hourly": "temperature_2m,weather_code,is_day,precipitation_probability",
-            "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max",
-        },
-    )
-    try:
-        cur, hr, dy = j["current"], j["hourly"], j["daily"]
-        start_key = cur["time"][:13] + ":00"
-        start = next((i for i, t in enumerate(hr["time"]) if t >= start_key), 0)
-        hourly = [
-            {"time": hr["time"][i], "temp": hr["temperature_2m"][i], "code": hr["weather_code"][i],
-             "is_day": bool(hr["is_day"][i]),
-             "precip": (hr.get("precipitation_probability") or [None] * len(hr["time"]))[i]}
-            for i in range(start, min(start + 8, len(hr["time"])))
-        ]
-        daily = [
-            {"date": dy["time"][i], "code": dy["weather_code"][i], "hi": dy["temperature_2m_max"][i],
-             "lo": dy["temperature_2m_min"][i]}
-            for i in range(len(dy["time"]))
-        ]
-        return {
-            "time": cur["time"], "temp": cur["temperature_2m"], "feels": cur["apparent_temperature"],
-            "humidity": cur["relative_humidity_2m"], "wind": cur["wind_speed_10m"],
-            "wind_dir": cur.get("wind_direction_10m"), "code": cur["weather_code"],
-            "is_day": bool(cur["is_day"]), "hi": dy["temperature_2m_max"][0], "lo": dy["temperature_2m_min"][0],
-            "uv": dy["uv_index_max"][0], "sunrise": dy["sunrise"][0], "sunset": dy["sunset"][0],
-            "hourly": hourly, "daily": daily,
+class WeatherData {
+  WeatherData(this.raw);
+  final Map<String, dynamic> raw;
+  Map<String, dynamic> get current => raw['current'] as Map<String, dynamic>;
+  Map<String, dynamic> get hourly => raw['hourly'] as Map<String, dynamic>;
+  Map<String, dynamic> get daily => raw['daily'] as Map<String, dynamic>;
+  String get condition =>
+      conditionName((current['weather_code'] as num).toInt());
+  String get kind => conditionKind((current['weather_code'] as num).toInt());
+  bool get isDay => (current['is_day'] as num? ?? 1) == 1;
+  int get temp => (current['temperature_2m'] as num).round();
+  int get feels =>
+      (current['apparent_temperature'] as num? ??
+              current['temperature_2m'] as num)
+          .round();
+  int get humidity => (current['relative_humidity_2m'] as num? ?? 0).round();
+  int get wind => (current['wind_speed_10m'] as num? ?? 0).round();
+  int get uv => ((daily['uv_index_max'] as List?)?.first as num? ?? 0).round();
+  int get high => ((daily['temperature_2m_max'] as List).first as num).round();
+  int get low => ((daily['temperature_2m_min'] as List).first as num).round();
+}
+
+class WeatherApi {
+  static Future<List<Place>> search(String query) async {
+    final uri = Uri.https('geocoding-api.open-meteo.com', '/v1/search', {
+      'name': query,
+      'count': '6',
+      'language': 'en',
+      'format': 'json',
+    });
+    final response = await http.get(uri).timeout(const Duration(seconds: 8));
+    if (response.statusCode != 200) {
+      throw Exception('City search is temporarily unavailable.');
+    }
+    final list = (jsonDecode(response.body)['results'] as List? ?? []);
+    return list
+        .map(
+          (e) => Place(
+            e['name'] ?? '',
+            e['admin1'] ?? '',
+            e['country'] ?? '',
+            (e['latitude'] as num).toDouble(),
+            (e['longitude'] as num).toDouble(),
+          ),
+        )
+        .toList();
+  }
+
+  static Future<WeatherData> forecast(Place place, bool imperial) async {
+    final uri = Uri.https('api.open-meteo.com', '/v1/forecast', {
+      'latitude': '${place.lat}',
+      'longitude': '${place.lon}',
+      'timezone': 'auto',
+      'temperature_unit': imperial ? 'fahrenheit' : 'celsius',
+      'wind_speed_unit': imperial ? 'mph' : 'kmh',
+      'current':
+          'temperature_2m,relative_humidity_2m,apparent_temperature,is_day,weather_code,wind_speed_10m',
+      'hourly': 'temperature_2m,precipitation_probability,weather_code,is_day',
+      'daily':
+          'weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max',
+      'forecast_days': '7',
+    });
+    final response = await http.get(uri).timeout(const Duration(seconds: 10));
+    if (response.statusCode != 200) {
+      throw Exception(
+        'Weather could not load. Check your connection and retry.',
+      );
+    }
+    return WeatherData(jsonDecode(response.body) as Map<String, dynamic>);
+  }
+}
+
+class WeatherHome extends StatefulWidget {
+  const WeatherHome({super.key});
+  @override
+  State<WeatherHome> createState() => _WeatherHomeState();
+}
+
+class _WeatherHomeState extends State<WeatherHome>
+    with TickerProviderStateMixin, WidgetsBindingObserver {
+  final searchController = TextEditingController();
+  final focus = FocusNode();
+  final suggestions = <Place>[];
+  Timer? debounce;
+  Place? place;
+  WeatherData? data;
+  bool imperial = false, loading = false;
+  bool _openingVault = false;
+  bool _checkingVaultAttempt = false;
+  bool _vaultReady = false;
+  String? _vaultCode;
+  String? error;
+  int requestId = 0;
+  late final AnimationController entrance = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..forward();
+  late final AnimationController float = AnimationController(
+    vsync: this,
+    duration: const Duration(seconds: 5),
+  )..repeat(reverse: true);
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    focus.addListener(_onFocusChanged);
+    _restore();
+  }
+
+  void _onFocusChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    debounce?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    searchController.dispose();
+    focus.dispose();
+    entrance.dispose();
+    float.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (!float.isAnimating) float.repeat(reverse: true);
+    } else {
+      float.stop();
+    }
+  }
+
+  Future<void> _restore() async {
+    const storage = FlutterSecureStorage();
+    _vaultCode = await storage.read(key: 'vault_code');
+    _vaultReady = true;
+    final saved = await storage.read(key: 'last_place');
+    if (mounted) setState(() {});
+    if (saved == null || !mounted) return;
+    try {
+      final p = Place.fromJson(jsonDecode(saved));
+      await _load(p, save: false);
+    } catch (_) {}
+  }
+
+  void _onQuery(String value) {
+    debounce?.cancel();
+    final q = value.trim();
+    if (!_vaultReady) {
+      setState(() => suggestions.clear());
+      return;
+    }
+    if (_vaultCode != null && q == _vaultCode) {
+      _unlockFromSearch(q);
+      return;
+    }
+    // A vault code is private input, not a city query. Avoid sending it to
+    // geocoding while the user is typing it.
+    if (_vaultCode != null && _vaultCode!.startsWith(q) && q.isNotEmpty) {
+      setState(() => suggestions.clear());
+      return;
+    }
+    if (q.length < 2 || !RegExp(r'^[a-zA-Z]').hasMatch(q)) {
+      setState(() => suggestions.clear());
+      return;
+    }
+    debounce = Timer(const Duration(milliseconds: 280), () async {
+      try {
+        final found = await WeatherApi.search(q);
+        if (mounted && searchController.text.trim() == q) {
+          setState(() {
+            suggestions
+              ..clear()
+              ..addAll(found);
+          });
         }
-    except (KeyError, IndexError, TypeError):
-        raise WeatherError("The weather service returned incomplete data.")
-
-
-def fmt_clock(iso: str) -> str:
-    return datetime.fromisoformat(iso).strftime("%I:%M %p").lstrip("0")
-
-
-def fmt_local(iso: str) -> str:
-    dt = datetime.fromisoformat(iso)
-    return dt.strftime("%a, %b %d · ") + dt.strftime("%I:%M %p").lstrip("0")
-
-
-def compass(deg) -> str:
-    if deg is None:
-        return "—"
-    return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((deg % 360) / 45 + 0.5) % 8]
-
-
-def uv_label(uv) -> str:
-    if uv is None:
-        return "No data"
-    return "Low" if uv < 3 else "Moderate" if uv < 6 else "High" if uv < 8 else "Very high" if uv < 11 else "Extreme"
-
-
-# ----------------------------------------------------------------------------
-# ANIMATED WIDGETS
-# ----------------------------------------------------------------------------
-class WeatherIcon(tk.Canvas):
-    """Animated weather illustration drawn with canvas primitives."""
-
-    def __init__(self, master, size=150, bg="#000000"):
-        super().__init__(master, width=size, height=size, bg=bg, highlightthickness=0, bd=0)
-        self.size, self.kind, self.is_day, self.t, self._job = size, "clear", True, 0, None
-        self.running = True
-        self._tick()
-
-    def stop_animation(self):
-        self.running = False
-        if self._job:
-            try:
-                self.after_cancel(self._job)
-            except tk.TclError:
-                pass
-            self._job = None
-
-    def start_animation(self):
-        if not self.running:
-            self.running = True
-            self._tick()
-
-    def set_state(self, kind: str, is_day: bool):
-        self.kind, self.is_day = kind, is_day
-
-    def destroy(self):
-        if self._job:
-            try:
-                self.after_cancel(self._job)
-            except tk.TclError:
-                pass
-        super().destroy()
-
-    def _tick(self):
-        try:
-            if not self.running:
-                return
-            self.t += 1
-            self._draw()
-            self._job = self.after(120, self._tick)
-        except tk.TclError:
-            pass
-
-    # primitives -----------------------------------------------------------
-    def _cloud(self, cx, cy, s, fill=WHITE):
-        # A soft offset shadow and a crisp highlight give the cloud a layered look.
-        shadow = mix(fill, "#26354A", 0.22)
-        for ox, oy, color in ((0, 3 * s, shadow), (0, 0, fill)):
-            self.create_oval(cx - 40*s + ox, cy - 6*s + oy, cx - 4*s + ox, cy + 30*s + oy, fill=color, outline="")
-            self.create_oval(cx - 24*s + ox, cy - 30*s + oy, cx + 22*s + ox, cy + 16*s + oy, fill=color, outline="")
-            self.create_oval(cx + 4*s + ox, cy - 12*s + oy, cx + 42*s + ox, cy + 30*s + oy, fill=color, outline="")
-            self.create_rectangle(cx - 22*s + ox, cy + 4*s + oy, cx + 24*s + ox, cy + 30*s + oy, fill=color, outline="")
-        self.create_arc(cx - 21*s, cy - 29*s, cx + 16*s, cy + 8*s, start=55, extent=92,
-                        style="arc", outline=mix(fill, WHITE, 0.35), width=max(1, 2*s))
-
-    def _stars(self, cx, cy, s, bg):
-        for i, (dx, dy) in enumerate([(-48,-34),(44,-43),(52,8),(-43,30),(8,48),(28,-8)]):
-            pulse = 0.35 + 0.55 * (0.5 + 0.5 * math.sin(self.t * 0.12 + i * 1.8))
-            r = (1.1 + (i % 2) * 0.7) * s
-            col = mix(bg, "#E7F1FF", pulse)
-            x, y = cx + dx*s, cy + dy*s
-            self.create_line(x-r*2, y, x+r*2, y, fill=col, width=1)
-            self.create_line(x, y-r*2, x, y+r*2, fill=col, width=1)
-            self.create_oval(x-r, y-r, x+r, y+r, fill=col, outline="")
-
-    def _sun(self, x, y, s):
-        pulse = 0.5 + 0.5 * math.sin(self.t * 0.06)
-        for ring in range(4, 0, -1):
-            r = (31 + ring * 5 + pulse * 3) * s
-            self.create_oval(x-r, y-r, x+r, y+r, fill=mix(self.cget("bg"), "#FFD43B", 0.08 + ring * 0.025), outline="")
-        for i in range(12):
-            a = self.t * 0.02 + i * math.pi / 6
-            r1, r2 = 36 * s, (46 + 3 * math.sin(self.t * 0.1 + i)) * s
-            self.create_line(x + r1 * math.cos(a), y + r1 * math.sin(a), x + r2 * math.cos(a), y + r2 * math.sin(a),
-                             fill="#FFD43B", width=max(2, 4 * s), capstyle="round")
-        self.create_oval(x - 26 * s, y - 26 * s, x + 26 * s, y + 26 * s, fill="#F6A91A", outline="")
-        self.create_oval(x - 23 * s, y - 23 * s, x + 23 * s, y + 23 * s, fill="#FFD43B", outline="")
-        self.create_oval(x - 16 * s, y - 17 * s, x + 14 * s, y + 13 * s, fill="#FFF0A6", outline="")
-
-    def _moon(self, x, y, s, bg):
-        halo = 38 * s
-        self.create_oval(x-halo, y-halo, x+halo, y+halo, fill=mix(bg, "#C8D8FF", 0.10), outline="")
-        self.create_oval(x - 26 * s, y - 26 * s, x + 26 * s, y + 26 * s, fill="#F4F1DE", outline="")
-        self.create_oval(x - 14 * s, y - 34 * s, x + 30 * s, y + 10 * s, fill=bg, outline="")
-        for i, (dx, dy) in enumerate([(-50, -40), (44, -46), (50, 20), (-46, 34), (10, 52)]):
-            col = mix(bg, WHITE, 0.45 + 0.4 * math.sin(self.t * 0.08 + i * 1.7))
-            r = 2 * s
-            self.create_oval(x + dx * s - r, y + dy * s - r, x + dx * s + r, y + dy * s + r, fill=col, outline="")
-
-    def _drops(self, cx, cy, s, bg, n=7, color="#8EC5FF"):
-        for i in range(n):
-            phase = (self.t * 3 + i * 23) % 48
-            x = cx - 32 * s + i * (64 * s / (n - 1)) + phase * 0.15 * s
-            y = cy + 22 * s + phase * s
-            col = mix(color, bg, phase / 56)
-            self.create_line(x, y, x - 3 * s, y + 10 * s, fill=col, width=2.5 * s, capstyle="round")
-
-    def _draw(self):
-        self.delete("all")
-        s = self.size / 150
-        cx = cy = self.size / 2
-        t, bg, k = self.t, self.cget("bg"), self.kind
-        if not self.is_day:
-            self._stars(cx, cy, s, bg)
-        if k == "clear":
-            self._sun(cx, cy, s) if self.is_day else self._moon(cx, cy, s, bg)
-        elif k == "clouds":
-            self._sun(cx + 22 * s, cy - 24 * s, s * 0.7) if self.is_day else self._moon(cx + 22 * s, cy - 24 * s, s * 0.7, bg)
-            dx = math.sin(t * 0.04) * 7 * s
-            self._cloud(cx + 28 * s - dx * 0.6, cy + 22 * s, s * 0.8, "#DCE6F2")
-            self._cloud(cx - 10 * s + dx, cy + 12 * s, s * 1.1, WHITE)
-        elif k == "rain":
-            self._cloud(cx, cy - 14 * s, s, "#E6ECF3")
-            self._drops(cx, cy - 10 * s, s, bg)
-        elif k == "snow":
-            self._cloud(cx, cy - 14 * s, s, "#EEF3F8")
-            for i in range(8):
-                phase = (t * 1.2 + i * 17) % 50
-                x = cx - 34 * s + i * (68 * s / 7) + math.sin((t + i * 9) * 0.08) * 5 * s
-                y = cy + 16 * s + phase * s
-                r = 2.6 * s
-                self.create_oval(x - r, y - r, x + r, y + r, fill=mix(WHITE, bg, phase / 70), outline="")
-        elif k == "storm":
-            self._cloud(cx, cy - 18 * s, s, "#B9C0CC")
-            self._drops(cx, cy - 14 * s, s, bg, n=5)
-            if (t // 8) % 7 < 2:
-                pts = [(2, 8), (-12, 36), (-2, 36), (-10, 60), (14, 28), (3, 28), (12, 8)]
-                self.create_polygon([(cx + x * s, cy + y * s) for x, y in pts], fill="#FFE066", outline="")
-        else:  # fog
-            self._cloud(cx, cy - 18 * s, s, "#DDE3EB")
-            for i in range(3):
-                off = math.sin(t * 0.03 + i) * 10 * s
-                y = cy + 22 * s + i * 14 * s
-                self.create_line(cx - 36 * s + off, y, cx + 36 * s + off, y,
-                                 fill=mix("#E2E8F0", bg, 0.15 * i), width=6 * s, capstyle="round")
-
-
-class Spinner(tk.Canvas):
-    def __init__(self, master, size=26, bg="#000000", color=WHITE):
-        super().__init__(master, width=size, height=size, bg=bg, highlightthickness=0, bd=0)
-        self.size, self.color, self.angle, self.running = size, color, 0, False
-
-    def start(self):
-        if not self.running:
-            self.running = True
-            self._tick()
-
-    def stop(self):
-        self.running = False
-        try:
-            self.delete("all")
-        except tk.TclError:
-            pass
-
-    def _tick(self):
-        if not self.running:
-            return
-        try:
-            self.delete("all")
-            p = 4
-            self.create_oval(p, p, self.size - p, self.size - p, outline=mix(self.cget("bg"), WHITE, 0.2), width=3)
-            self.create_arc(p, p, self.size - p, self.size - p, start=self.angle, extent=110, style="arc",
-                            outline=self.color, width=3)
-            self.angle = (self.angle + 16) % 360
-            self.after(80, self._tick)
-        except tk.TclError:
-            self.running = False
-
-
-class PulseDot(tk.Canvas):
-    def __init__(self, master, bg="#000000"):
-        super().__init__(master, width=18, height=18, bg=bg, highlightthickness=0, bd=0)
-        self.color, self.t = "#34D399", 0
-        self.running = True
-        self._job = None
-        self._tick()
-
-    def stop_animation(self):
-        self.running = False
-        if self._job:
-            try:
-                self.after_cancel(self._job)
-            except tk.TclError:
-                pass
-            self._job = None
-
-    def start_animation(self):
-        if not self.running:
-            self.running = True
-            self._tick()
-
-    def set_state(self, live: bool):
-        self.color = "#34D399" if live else "#F87171"
-
-    def _tick(self):
-        if not self.running:
-            return
-        try:
-            self.delete("all")
-            self.t += 1
-            ph = (self.t % 40) / 40
-            r = 3 + 6 * ph
-            self.create_oval(9 - r, 9 - r, 9 + r, 9 + r, outline=mix(self.color, self.cget("bg"), ph), width=1.5)
-            self.create_oval(5.5, 5.5, 12.5, 12.5, fill=self.color, outline="")
-            if self.running:
-                self._job = self.after(120, self._tick)
-        except tk.TclError:
-            pass
-
-
-# ----------------------------------------------------------------------------
-# SETUP + PIN FIELDS
-# ----------------------------------------------------------------------------
-class PinFields(ctk.CTkFrame):
-    def __init__(self, master, width=340, fg="transparent"):
-        super().__init__(master, fg_color=fg)
-        self.e1 = ctk.CTkEntry(self, placeholder_text="Create access code", show="•", width=width, height=42, corner_radius=12)
-        self.e2 = ctk.CTkEntry(self, placeholder_text="Confirm access code", show="•", width=width, height=42, corner_radius=12)
-        self.e1.pack(pady=(0, 10))
-        self.e2.pack()
-        self.show = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(self, text="Show code", variable=self.show, command=self._toggle,
-                        checkbox_width=18, checkbox_height=18, font=font(12)).pack(anchor="w", pady=(10, 0))
-
-    def _toggle(self):
-        ch = "" if self.show.get() else "•"
-        self.e1.configure(show=ch)
-        self.e2.configure(show=ch)
-
-    def get(self):
-        return self.e1.get(), self.e2.get()
-
-
-class SetupView(ctk.CTkFrame):
-    """First-launch screen where the user creates their own secret access code."""
-
-    def __init__(self, app, on_done):
-        super().__init__(app, fg_color="#0E1633", corner_radius=0)
-        self.app, self.on_done = app, on_done
-        card = ctk.CTkFrame(self, corner_radius=28, fg_color="#1A2347")
-        card.place(relx=0.5, rely=0.5, anchor="center")
-        ctk.CTkLabel(card, text="🔐", font=font(40)).pack(pady=(30, 0), padx=50)
-        ctk.CTkLabel(card, text="Secure your private space", font=font(24, "bold")).pack(pady=(6, 4))
-        ctk.CTkLabel(
-            card, wraplength=380, justify="center", text_color=MUTED, font=font(13),
-            text="Create a secret access code. Typing it into the search bar and pressing Enter "
-                 "opens your private vault. Anything else is a normal city search.",
-        ).pack(padx=30)
-        self.fields = PinFields(card)
-        self.fields.pack(pady=(20, 6))
-        ctk.CTkLabel(
-            card, justify="left", text_color=MUTED, font=font(12),
-            text="•  At least 6 characters\n•  Must start with a digit or symbol, e.g. #Moon4721\n"
-                 "    (keeps your code from ever reaching the autocomplete service)",
-        ).pack(anchor="w", padx=60, pady=(8, 0))
-        self.err = ctk.CTkLabel(card, text="", text_color="#FF8A8A", font=font(12))
-        self.err.pack(pady=(8, 0))
-        ctk.CTkButton(card, text="Continue", width=340, height=44, corner_radius=22, font=font(15, "bold"),
-                      command=self._submit).pack(pady=(6, 10))
-        ctk.CTkLabel(
-            card, wraplength=380, text_color="#8EA0C8", font=font(11),
-            text="There is no recovery option. If you forget the code, delete the folder "
-                 f"{APP_DIR} to reset (the vault will be erased).",
-        ).pack(padx=30, pady=(0, 28))
-        self.fields.e2.bind("<Return>", lambda e: self._submit())
-        self.after(150, self.fields.e1.focus_set)
-
-    def _submit(self):
-        pin, conf = self.fields.get()
-        err = validate_pin(pin, conf)
-        if err:
-            self.err.configure(text=err)
-            return
-        if VAULT_PATH.exists():  # orphaned vault from a deleted config can't be decrypted any more
-            try:
-                os.replace(VAULT_PATH, VAULT_PATH.with_suffix(".orphan"))
-            except OSError:
-                pass
-        self.app.security.set_pin(pin)
-        self.on_done()
-
-
-# ----------------------------------------------------------------------------
-# WEATHER VIEW (the decoy, but a genuinely working weather app)
-# ----------------------------------------------------------------------------
-class WeatherView(ctk.CTkFrame):
-    def __init__(self, app):
-        self.bg = THEMES[("clear", True)]
-        super().__init__(app, fg_color=self.bg, corner_radius=0)
-        self.app = app
-        self.units = app.security.cfg.get("units", "metric")
-        self.place_cur: Place | None = None
-        self.data: dict | None = None
-        self._cards: list = []
-        self._canv_card: list = []
-        self._canv_stage: list = []
-        self._q: queue.Queue = queue.Queue()
-        self._load_seq = self._suggest_seq = self._theme_token = self._fade_token = 0
-        self._suggest_job = self._toast_job = None
-        self._chart_anim_job = None
-        self._chart_canvas = None
-        self._chart_points = []
-        self._chart_index = 0
-        self._chart_marker = None
-        self._build()
-        self._apply_theme(self.bg)
-        self._drain_job = self.after(100, self._drain)
-        self.after(REFRESH_MS, self._auto_refresh)
-        self._restore_last()
-
-    # ---- thread-safe dispatch to the UI thread ---------------------------
-    def _post(self, fn, *args):
-        self._q.put((fn, args))
-
-    def _drain(self):
-        try:
-            while True:
-                fn, args = self._q.get_nowait()
-                try:
-                    fn(*args)
-                except Exception:
-                    traceback.print_exc()
-        except queue.Empty:
-            pass
-        self._drain_job = self.after(100, self._drain)
-
-    def pause_background(self):
-        if self._drain_job:
-            self.after_cancel(self._drain_job)
-            self._drain_job = None
-        self.icon.stop_animation()
-        self.dot.stop_animation()
-        if self._chart_anim_job:
-            self.after_cancel(self._chart_anim_job)
-            self._chart_anim_job = None
-
-    def resume_background(self):
-        self.icon.start_animation()
-        self.dot.start_animation()
-        if self._chart_canvas and self._chart_points:
-            self._animate_chart_marker()
-        if not self._drain_job:
-            self._drain_job = self.after(100, self._drain)
-
-    # ---- layout ------------------------------------------------------------
-    def _card(self, parent, radius=24):
-        f = ctk.CTkFrame(parent, corner_radius=radius, fg_color=mix(self.bg, WHITE, 0.14))
-        self._cards.append(f)
-        return f
-
-    def _build(self):
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
-
-        # top bar
-        top = ctk.CTkFrame(self, fg_color="transparent")
-        top.grid(row=0, column=0, sticky="ew", padx=26, pady=(22, 10))
-        top.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(top, text="Weather", font=font(24, "bold")).grid(row=0, column=0, padx=(0, 20))
-        self.entry = ctk.CTkEntry(top, placeholder_text="🔍  Search city…", height=44, corner_radius=22, border_width=0,
-                                  text_color=WHITE, placeholder_text_color=MUTED, font=font(15))
-        self.entry.grid(row=0, column=1, sticky="ew")
-        self.entry.bind("<Return>", self._on_submit)
-        self.entry.bind("<KeyRelease>", self._on_key)
-        self.search_btn = ctk.CTkButton(top, text="Search", width=96, height=44, corner_radius=22,
-                                        font=font(14, "bold"), text_color=WHITE, command=self._on_submit)
-        self.search_btn.grid(row=0, column=2, padx=(10, 0))
-        self.spinner = Spinner(top, bg=self.bg)
-        self.spinner.grid(row=0, column=3, padx=10)
-        self._canv_stage.append(self.spinner)
-        self.location_btn = ctk.CTkButton(top, text="◎", width=40, height=40, corner_radius=20,
-                                           font=font(20), command=self._use_current_location,
-                                           fg_color="transparent", hover_color=mix(self.bg, WHITE, 0.25),
-                                           text_color=WHITE)
-        self.location_btn.grid(row=0, column=4, padx=(8, 0))
-        self.unit_btn = ctk.CTkSegmentedButton(
-            top, values=["°C", "°F"], width=100, height=36, command=self._on_units, text_color=WHITE,
-            selected_color="#FFFFFF", selected_hover_color="#E8EEF7")
-        self.unit_btn.set("°C" if self.units == "metric" else "°F")
-        self.unit_btn.grid(row=0, column=5)
-
-        # content
-        content = ctk.CTkFrame(self, fg_color="transparent")
-        content.grid(row=1, column=0, sticky="nsew", padx=26, pady=(4, 6))
-        content.grid_columnconfigure(0, weight=3, uniform="c")
-        content.grid_columnconfigure(1, weight=2, uniform="c")
-        content.grid_rowconfigure(0, weight=1)
-
-        left = ctk.CTkFrame(content, fg_color="transparent")
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
-        left.grid_columnconfigure(0, weight=1)
-        left.grid_rowconfigure(0, weight=3)
-        left.grid_rowconfigure(1, weight=2)
-        right = ctk.CTkFrame(content, fg_color="transparent")
-        right.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(1, weight=1)
-
-        self._build_hero(left)
-        self._build_hourly(left)
-        self._build_stats(right)
-        self._build_daily(right)
-
-        # footer
-        foot = ctk.CTkFrame(self, fg_color="transparent")
-        foot.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 14))
-        foot.grid_columnconfigure(1, weight=1)
-        self.dot = PulseDot(foot, bg=self.bg)
-        self.dot.grid(row=0, column=0)
-        self._canv_stage.append(self.dot)
-        self.status = ctk.CTkLabel(foot, text="Waiting for a location", font=font(12), text_color=MUTED)
-        self.status.grid(row=0, column=1, sticky="w", padx=6)
-        ctk.CTkLabel(foot, text="Weather: Open-Meteo · Approx. location: IP-based", font=font(11), text_color=MUTED).grid(row=0, column=2)
-
-        # overlays
-        self.suggest = ctk.CTkFrame(self, corner_radius=16, border_width=1)
-        self.suggest.pack_propagate(False)
-        self.toast = ctk.CTkFrame(self, corner_radius=18, fg_color="#B3261E")
-        self.toast_lbl = ctk.CTkLabel(self.toast, text="", font=font(13, "bold"), text_color=WHITE)
-        self.toast_lbl.pack(padx=20, pady=9)
-        self.app.bind_all("<Button-1>", self._on_click_anywhere, add="+")  # root CTk allows bind_all; CTk widgets do not
-
-    def _build_hero(self, parent):
-        hero = self._card(parent, 28)
-        hero.grid(row=0, column=0, sticky="nsew", pady=(0, 7))
-        hero.grid_columnconfigure((0, 1), weight=1)
-        self.city_lbl = ctk.CTkLabel(hero, text="Search for a city", font=font(30, "bold"), anchor="w")
-        self.city_lbl.grid(row=0, column=0, columnspan=2, sticky="w", padx=28, pady=(24, 0))
-        self.time_lbl = ctk.CTkLabel(hero, text="Type a location above to begin", font=font(13), text_color=MUTED, anchor="w")
-        self.time_lbl.grid(row=1, column=0, columnspan=2, sticky="w", padx=28)
-        self.icon = WeatherIcon(hero, 150, bg=mix(self.bg, WHITE, 0.14))
-        self.icon.grid(row=2, column=0, padx=(20, 0), pady=8)
-        self._canv_card.append(self.icon)
-        box = ctk.CTkFrame(hero, fg_color="transparent")
-        box.grid(row=2, column=1, sticky="w", padx=(0, 20))
-        self.temp_lbl = ctk.CTkLabel(box, text="--°", font=font(88, "bold"), anchor="w")
-        self.temp_lbl.pack(anchor="w")
-        self.cond_lbl = ctk.CTkLabel(box, text="", font=font(20), anchor="w")
-        self.cond_lbl.pack(anchor="w")
-        self.hilo_lbl = ctk.CTkLabel(box, text="", font=font(14), text_color=MUTED, anchor="w")
-        self.hilo_lbl.pack(anchor="w")
-        self.sun_lbl = ctk.CTkLabel(hero, text="", font=font(12), text_color=MUTED)
-        self.sun_lbl.grid(row=3, column=0, columnspan=2, pady=(0, 18))
-
-    def _build_hourly(self, parent):
-        card = self._card(parent)
-        card.grid(row=1, column=0, sticky="nsew", pady=(7, 0))
-        card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(card, text="NEXT HOURS  ·  TEMPERATURE & RAIN CHANCE", font=font(11, "bold"), text_color=MUTED).grid(
-            row=0, column=0, sticky="w", padx=20, pady=(14, 4))
-        self.hourly_row = ctk.CTkFrame(card, fg_color="transparent")
-        self.hourly_row.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 12))
-        card.grid_rowconfigure(1, weight=1)
-
-    def _build_stats(self, parent):
-        grid = ctk.CTkFrame(parent, fg_color="transparent")
-        grid.grid(row=0, column=0, sticky="ew", pady=(0, 7))
-        grid.grid_columnconfigure((0, 1), weight=1, uniform="s")
-        self.stat = {}
-        for i, (key, title) in enumerate([("feels", "FEELS LIKE"), ("hum", "HUMIDITY"), ("wind", "WIND"), ("uv", "UV INDEX")]):
-            tile = self._card(grid, 20)
-            tile.grid(row=i // 2, column=i % 2, sticky="nsew", padx=(0 if i % 2 == 0 else 6, 6 if i % 2 == 0 else 0),
-                      pady=(0 if i < 2 else 12, 0))
-            ctk.CTkLabel(tile, text=title, font=font(11, "bold"), text_color=MUTED).pack(anchor="w", padx=16, pady=(12, 0))
-            val = ctk.CTkLabel(tile, text="—", font=font(26, "bold"))
-            val.pack(anchor="w", padx=16)
-            sub = ctk.CTkLabel(tile, text="", font=font(12), text_color=MUTED, wraplength=150, justify="left")
-            sub.pack(anchor="w", padx=16, pady=(0, 12))
-            self.stat[key] = (val, sub)
-
-    def _build_daily(self, parent):
-        card = self._card(parent)
-        card.grid(row=1, column=0, sticky="nsew", pady=(7, 0))
-        card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(card, text="7-DAY FORECAST", font=font(11, "bold"), text_color=MUTED).grid(
-            row=0, column=0, sticky="w", padx=20, pady=(14, 4))
-        self.daily_body = ctk.CTkFrame(card, fg_color="transparent")
-        self.daily_body.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 10))
-        self.daily_body.grid_columnconfigure(0, weight=1)
-        card.grid_rowconfigure(1, weight=1)
-
-    # ---- theming / animation -------------------------------------------
-    def _alive(self, lst):
-        lst[:] = [w for w in lst if w.winfo_exists()]
-        return lst
-
-    def _paint(self, widget, behind: str):
-        """CustomTkinter only propagates bg_color one level; push it down the whole tree."""
-        for ch in widget.winfo_children():
-            if not is_ctk(ch):
-                continue
-            try:
-                ch.configure(bg_color=behind)
-            except Exception:
-                pass
-            if isinstance(ch, ctk.CTkFrame):
-                fg = ch.cget("fg_color")
-                self._paint(ch, behind if fg == "transparent" else fg)
-
-    def _apply_theme(self, color: str):
-        self.bg = color
-        card, inp = mix(color, WHITE, 0.14), mix(color, WHITE, 0.20)
-        self.configure(fg_color=color)
-        for w in self._alive(self._cards):
-            w.configure(fg_color=card)
-        for w in self._alive(self._canv_card):
-            w.configure(bg=card)
-        for w in self._alive(self._canv_stage):
-            w.configure(bg=color)
-        self.entry.configure(fg_color=inp)
-        self.search_btn.configure(fg_color=mix(color, WHITE, 0.30), hover_color=mix(color, WHITE, 0.42))
-        self.unit_btn.configure(fg_color=inp, unselected_color=inp, unselected_hover_color=mix(color, WHITE, 0.28))
-        self.location_btn.configure(hover_color=mix(color, WHITE, 0.25))
-        self.suggest.configure(fg_color=mix(color, "#0A0F1C", 0.55), border_color=mix(color, WHITE, 0.25))
-        self._paint(self, color)
-
-    def _animate_to(self, target: str):
-        start = self.bg
-        if start == target:
-            return
-        self._theme_token += 1
-        token, steps = self._theme_token, 10
-
-        def step(i):
-            if token != self._theme_token:
-                return
-            self._apply_theme(mix(start, target, ease(i / steps)))
-            if i < steps:
-                self.after(28, lambda: step(i + 1))
-
-        step(1)
-
-    def _fade_in(self, items):
-        self._fade_token += 1
-        token, steps = self._fade_token, 9
-
-        def step(i):
-            if token != self._fade_token:
-                return
-            base = mix(self.bg, WHITE, 0.14)
-            for lbl, end in items:
-                try:
-                    lbl.configure(text_color=mix(base, end, ease(i / steps)))
-                except tk.TclError:
-                    pass
-            if i < steps:
-                self.after(60, lambda: step(i + 1))
-
-        step(0)
-
-    # ---- toast + suggestions ----------------------------------------------
-    def show_toast(self, msg: str, error: bool = True):
-        self.toast.configure(fg_color="#B3261E" if error else "#1F7A4D")
-        self.toast_lbl.configure(text=msg)
-        self.toast.place(relx=0.5, y=90, anchor="n")
-        self.toast.lift()
-        if self._toast_job:
-            self.after_cancel(self._toast_job)
-        self._toast_job = self.after(4500, self.toast.place_forget)
-
-    def _hide_suggestions(self):
-        self._suggest_seq += 1
-        self.suggest.place_forget()
-
-    def _on_click_anywhere(self, event):
-        w = str(event.widget)
-        if self.suggest.winfo_ismapped() and not w.startswith(str(self.suggest)) and not w.startswith(str(self.entry)):
-            self._hide_suggestions()
-
-    def _on_key(self, event):
-        if event.keysym == "Escape":
-            self._hide_suggestions()
-            return
-        if event.keysym in ("Return", "Up", "Down", "Left", "Right", "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R"):
-            return
-        text = self.entry.get().strip()
-        if self._suggest_job:
-            self.after_cancel(self._suggest_job)
-        # Privacy rule: only letter-initial text is ever sent to the geocoder, so a
-        # secret code (which must start with a digit/symbol) can't leak while typing.
-        if len(text) < 2 or not text[0].isalpha():
-            self._hide_suggestions()
-            return
-        self._suggest_job = self.after(320, lambda t=text: self._suggest(t))
-
-    def _suggest(self, text):
-        self._suggest_seq += 1
-        seq = self._suggest_seq
-
-        def work():
-            try:
-                places = search_places(text, 6)
-            except WeatherError:
-                places = []
-            self._post(self._show_suggestions, seq, text, places)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _show_suggestions(self, seq, text, places):
-        if seq != self._suggest_seq or self.entry.get().strip() != text or not places:
-            if seq == self._suggest_seq:
-                self.suggest.place_forget()
-            return
-        for ch in self.suggest.winfo_children():
-            ch.destroy()
-        for p in places:
-            feature = p.feature.replace("_", " ")
-            info = f"{p.label}  ·  {feature}" if feature else p.label
-            ctk.CTkButton(self.suggest, text=info, anchor="w", height=38, corner_radius=10,
-                          fg_color="transparent", hover_color=mix(self.bg, WHITE, 0.25), text_color=WHITE,
-                          font=font(14), command=lambda p=p: self._choose(p)).pack(fill="x", padx=6, pady=(6 if p is places[0] else 0, 0))
-        self.update_idletasks()
-        x = self.entry.winfo_rootx() - self.winfo_rootx()
-        y = self.entry.winfo_rooty() - self.winfo_rooty() + self.entry.winfo_height() + 6
-        self.suggest.configure(width=self.entry.winfo_width(), height=len(places) * 38 + 14)
-        self.suggest.place(x=x, y=y)
-        self.suggest.lift()
-
-    def _choose(self, place: Place):
-        self._hide_suggestions()
-        self.entry.delete(0, "end")
-        self.entry.insert(0, place.name)
-        self.focus_set()
-        self._load_place(place)
-
-    def _use_current_location(self):
-        """Use network-based approximate location; no device GPS permission is available in Tk."""
-        self.spinner.start()
-        self.status.configure(text="Finding your approximate location…")
-        self._load_seq += 1
-        seq = self._load_seq
-
-        def work():
-            try:
-                info = http_get_json("https://ipapi.co/json/", {})
-                lat, lon = float(info["latitude"]), float(info["longitude"])
-                place = Place(info.get("city") or "Your location", info.get("region") or "", info.get("country_name") or "", lat, lon)
-                data = fetch_forecast(place, self.units)
-                self._post(self._on_loaded, seq, place, data)
-            except (WeatherError, KeyError, TypeError, ValueError) as exc:
-                self._post(self._on_error, seq, str(exc) if isinstance(exc, WeatherError) else "Could not determine your approximate location.")
-        threading.Thread(target=work, daemon=True).start()
-
-    # ---- search flow ----------------------------------------------------
-    def _on_submit(self, event=None):
-        text = self.entry.get().strip()
-        self._hide_suggestions()
-        if not text:
-            self.show_toast("Please enter a city name.")
-            return
-        # SECRET TRIGGER: runs locally, before any network call.
-        if not text[0].isalpha() and self.app.try_unlock(text):
-            self.entry.delete(0, "end")
-            return
-        self._load_query(text)
-
-    def _load_query(self, text):
-        self._load_seq += 1
-        seq = self._load_seq
-        self.spinner.start()
-
-        def work():
-            try:
-                places = search_places(text, 1)
-                if not places:
-                    raise WeatherError("Location not found. Check the spelling and try again.")
-                data = fetch_forecast(places[0], self.units)
-                self._post(self._on_loaded, seq, places[0], data)
-            except WeatherError as e:
-                self._post(self._on_error, seq, str(e))
-            except Exception:
-                traceback.print_exc()
-                self._post(self._on_error, seq, "Something went wrong. Please try again.")
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _load_place(self, place: Place, silent: bool = False):
-        self._load_seq += 1
-        seq = self._load_seq
-        if not silent:
-            self.spinner.start()
-
-        def work():
-            try:
-                self._post(self._on_loaded, seq, place, fetch_forecast(place, self.units))
-            except WeatherError as e:
-                self._post(self._on_error, seq, str(e), silent)
-            except Exception:
-                traceback.print_exc()
-                self._post(self._on_error, seq, "Something went wrong. Please try again.", silent)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_error(self, seq, msg, silent=False):
-        if seq != self._load_seq:
-            return
-        self.spinner.stop()
-        self.dot.set_state(False)
-        self.status.configure(text="Offline · showing last update" if self.data else msg)
-        if not silent:
-            self.show_toast(msg)
-
-    def _on_loaded(self, seq, place, data):
-        if seq != self._load_seq:
-            return
-        self.spinner.stop()
-        self.place_cur, self.data = place, data
-        self.app.security.update_prefs(
-            last_place={"name": place.name, "admin": place.admin, "country": place.country,
-                        "lat": place.lat, "lon": place.lon})
-        self._render(place, data)
-
-    def _on_units(self, value):
-        self.units = "metric" if value == "°C" else "imperial"
-        self.app.security.update_prefs(units=self.units)
-        if self.place_cur:
-            self._load_place(self.place_cur)
-
-    def _restore_last(self):
-        lp = self.app.security.cfg.get("last_place")
-        if lp:
-            try:
-                self._load_place(Place(lp["name"], lp.get("admin", ""), lp.get("country", ""), lp["lat"], lp["lon"]))
-            except KeyError:
-                pass
-
-    def _auto_refresh(self):
-        if self.place_cur and self.app.vault_view is None:
-            self._load_place(self.place_cur, silent=True)
-        self.after(REFRESH_MS, self._auto_refresh)
-
-    # ---- rendering ---------------------------------------------------------
-    def _render(self, place: Place, d: dict):
-        label, kind, _ = describe(d["code"], d["is_day"])
-        wind_unit = "km/h" if self.units == "metric" else "mph"
-        region = ", ".join(x for x in (place.admin, place.country) if x)
-        self.city_lbl.configure(text=place.name)
-        self.time_lbl.configure(text=f"{region}  ·  {fmt_local(d['time'])}" if region else fmt_local(d["time"]))
-        self.temp_lbl.configure(text=f"{round(d['temp'])}°")
-        self.cond_lbl.configure(text=label)
-        self.hilo_lbl.configure(text=f"H: {round(d['hi'])}°    L: {round(d['lo'])}°")
-        self.sun_lbl.configure(text=f"🌅 {fmt_clock(d['sunrise'])}      🌇 {fmt_clock(d['sunset'])}")
-        self.icon.set_state(kind, d["is_day"])
-
-        diff = d["feels"] - d["temp"]
-        feels_sub = "Similar to the actual temperature" if abs(diff) <= 1 else (
-            "Feels colder than the actual temperature" if diff < 0 else "Feels warmer than the actual temperature")
-        hum = d["humidity"]
-        hum_sub = "Dry air" if hum < 30 else "Comfortable" if hum <= 60 else "Humid"
-        uv = d["uv"]
-        vals = {
-            "feels": (f"{round(d['feels'])}°", feels_sub),
-            "hum": (f"{hum}%", hum_sub),
-            "wind": (f"{round(d['wind'])} {wind_unit}", f"From the {compass(d['wind_dir'])}"),
-            "uv": ("—" if uv is None else f"{uv:.0f}", uv_label(uv) + " today"),
-        }
-        for k, (v, s) in vals.items():
-            self.stat[k][0].configure(text=v)
-            self.stat[k][1].configure(text=s)
-
-        self._build_hourly_rows(d)
-        self._build_daily_rows(d)
-        target = THEMES[(kind, d["is_day"])]
-        self._animate_to(target)
-        self._fade_in([(self.city_lbl, WHITE), (self.temp_lbl, WHITE), (self.cond_lbl, WHITE),
-                       (self.time_lbl, MUTED), (self.hilo_lbl, MUTED)])
-        self.dot.set_state(True)
-        self.status.configure(text=f"Live · updated {datetime.now().strftime('%I:%M %p').lstrip('0')}")
-
-    def _build_hourly_rows(self, d):
-        if self._chart_anim_job:
-            self.after_cancel(self._chart_anim_job)
-            self._chart_anim_job = None
-        self._chart_canvas, self._chart_points, self._chart_marker = None, [], None
-        for ch in self.hourly_row.winfo_children():
-            ch.destroy()
-        values = [h["temp"] for h in d["hourly"]]
-        chart = tk.Canvas(self.hourly_row, height=52, bg=mix(self.bg, WHITE, 0.14), highlightthickness=0, bd=0)
-        chart.grid(row=0, column=0, columnspan=max(len(values), 1), sticky="ew", padx=12, pady=(2, 0))
-        self._canv_card.append(chart)
-        chart.update_idletasks()
-        width = max(chart.winfo_width(), 420)
-        low, high = min(values), max(values)
-        span = max(high - low, 1)
-        pts = [(16 + i * (width - 32) / max(len(values) - 1, 1), 40 - (v - low) / span * 26) for i, v in enumerate(values)]
-        if pts:
-            area = [pts[0][0], 48] + [coord for point in pts for coord in point] + [pts[-1][0], 48]
-            chart.create_polygon(area, fill=mix(self.bg, "#67B8FF", 0.22), outline="")
-        for a, b in zip(pts, pts[1:]):
-            chart.create_line(*a, *b, fill=mix(self.bg, "#B8DEFF", 0.86), width=5, smooth=True)
-            chart.create_line(*a, *b, fill="#FFFFFF", width=2, smooth=True)
-        for x, y in pts:
-            chart.create_oval(x-3, y-3, x+3, y+3, fill=WHITE, outline="#A9D5FF", width=1)
-        if pts:
-            self._chart_canvas, self._chart_points = chart, pts
-            self._chart_index = 0
-            x, y = pts[0]
-            self._chart_marker = (
-                chart.create_oval(x-7, y-7, x+7, y+7, outline="#9AD7FF", width=2),
-                chart.create_oval(x-2, y-2, x+2, y+2, fill=WHITE, outline="")
+      } catch (_) {
+        if (mounted) setState(() => suggestions.clear());
+      }
+    });
+  }
+
+  Future<void> _select(Place p) {
+    focus.unfocus();
+    setState(() {
+      suggestions.clear();
+      searchController.text = p.name;
+    });
+    return _load(p);
+  }
+
+  Future<void> _search() async {
+    if (_openingVault) return;
+    final q = searchController.text.trim();
+    if (q.isEmpty) {
+      setState(() => error = 'Search for a city to see its weather.');
+      return;
+    }
+    if (!_vaultReady) {
+      _vaultCode = await const FlutterSecureStorage().read(key: 'vault_code');
+      _vaultReady = true;
+      if (!mounted) return;
+    }
+    if (_vaultCode != null && q == _vaultCode) {
+      await _unlockFromSearch(q);
+      return;
+    }
+    // Vault passcodes start with a digit or symbol. Keep those inputs local
+    // even when a passcode is mistyped; never send them to geocoding.
+    if (!RegExp(r'^[a-zA-Z]').hasMatch(q)) {
+      final attemptMessage = await _recordFailedVaultAttempt();
+      if (!mounted) return;
+      focus.unfocus();
+      setState(() {
+        suggestions.clear();
+        error = attemptMessage ?? 'No city found. Try another search.';
+      });
+      return;
+    }
+    focus.unfocus();
+    setState(() => suggestions.clear());
+    try {
+      final results = await WeatherApi.search(q);
+      if (results.isEmpty) {
+        throw Exception('No matching city. Try adding a region or country.');
+      }
+      await _load(results.first);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          loading = false;
+          error = _cleanError(e);
+        });
+      }
+    }
+  }
+
+  String _cleanError(Object e) => e.toString().replaceFirst('Exception: ', '');
+
+  Future<String?> _recordFailedVaultAttempt() async {
+    if (_vaultCode == null) return null;
+    if (_checkingVaultAttempt) return 'Please wait a moment.';
+    _checkingVaultAttempt = true;
+    const storage = FlutterSecureStorage();
+    try {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final lockUntil =
+          int.tryParse(await storage.read(key: 'vault_lockout_until') ?? '') ??
+          0;
+      if (lockUntil > now) {
+        final seconds = ((lockUntil - now) / 1000).ceil();
+        return 'Try again in ${seconds}s.';
+      }
+      final attempts =
+          (int.tryParse(
+                await storage.read(key: 'vault_failed_attempts') ?? '',
+              ) ??
+              0) +
+          1;
+      if (attempts >= 5) {
+        final until = now + const Duration(seconds: 30).inMilliseconds;
+        await storage.write(key: 'vault_failed_attempts', value: '0');
+        await storage.write(
+          key: 'vault_lockout_until',
+          value: until.toString(),
+        );
+        return 'Try again in 30s.';
+      }
+      await storage.write(
+        key: 'vault_failed_attempts',
+        value: attempts.toString(),
+      );
+      return 'No city found. Try another search.';
+    } catch (_) {
+      return 'No city found. Try another search.';
+    } finally {
+      _checkingVaultAttempt = false;
+    }
+  }
+
+  Future<void> _unlockFromSearch(String code) async {
+    if (_openingVault) return;
+    _openingVault = true;
+    focus.unfocus();
+    debounce?.cancel();
+    setState(() {
+      suggestions.clear();
+      searchController.clear();
+      error = null;
+    });
+    try {
+      await _openVault(initialCode: code);
+    } finally {
+      _openingVault = false;
+    }
+  }
+
+  bool get _isVaultCodeDraft {
+    final query = searchController.text.trim();
+    final code = _vaultCode;
+    if (!_vaultReady) return true;
+    if (query.isEmpty) return false;
+    return !RegExp(r'^[a-zA-Z]').hasMatch(query) ||
+        (code != null && code.startsWith(query));
+  }
+
+  Future<void> _load(Place p, {bool save = true}) async {
+    final id = ++requestId;
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      final result = await WeatherApi.forecast(p, imperial);
+      if (!mounted || id != requestId) return;
+      setState(() {
+        place = p;
+        data = result;
+        loading = false;
+        error = null;
+      });
+      entrance.forward(from: 0);
+      if (save) {
+        const FlutterSecureStorage().write(
+          key: 'last_place',
+          value: jsonEncode(p.toJson()),
+        );
+      }
+    } catch (e) {
+      if (mounted && id == requestId) {
+        setState(() {
+          loading = false;
+          error = _cleanError(e);
+        });
+      }
+    }
+  }
+
+  Future<void> _locate() async {
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        throw Exception('Turn on location services and try again.');
+      }
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        throw Exception('Allow location access to use nearby weather.');
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.medium,
+          timeLimit: Duration(seconds: 12),
+        ),
+      );
+      await _load(Place('My location', '', '', pos.latitude, pos.longitude));
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          loading = false;
+          error = _cleanError(e);
+        });
+      }
+    }
+  }
+
+  void _changeUnits(bool value) {
+    setState(() => imperial = value);
+    if (place != null) _load(place!);
+  }
+
+  String _hourLabel(String iso, int index) {
+    if (index == 0) return 'Now';
+    final t = DateTime.tryParse(iso);
+    if (t == null) return '';
+    final h = t.hour;
+    return '${h == 0
+        ? 12
+        : h > 12
+        ? h - 12
+        : h}${h < 12 ? 'AM' : 'PM'}';
+  }
+
+  String _dayLabel(String date, int index) {
+    if (index == 0) return 'Today';
+    final d = DateTime.tryParse(date);
+    return d == null
+        ? ''
+        : const ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][d.weekday -
+              1];
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final d = data;
+    return Scaffold(
+      body: Stack(
+        children: [
+          const _Backdrop(),
+          SafeArea(
+            child: CustomScrollView(
+              physics: const BouncingScrollPhysics(),
+              slivers: [
+                SliverPadding(
+                  padding: const EdgeInsets.fromLTRB(20, 14, 20, 32),
+                  sliver: SliverList(
+                    delegate: SliverChildListDelegate([
+                      _topBar(),
+                      const SizedBox(height: 18),
+                      _searchArea(),
+                      if (suggestions.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        TweenAnimationBuilder<double>(
+                          tween: Tween(begin: 0, end: 1),
+                          duration: const Duration(milliseconds: 220),
+                          curve: Curves.easeOutCubic,
+                          builder: (_, value, child) => Opacity(
+                            opacity: value,
+                            child: Transform.translate(
+                              offset: Offset(0, (1 - value) * 8),
+                              child: child,
+                            ),
+                          ),
+                          child: _suggestionPanel(),
+                        ),
+                      ],
+                      if (error != null) ...[
+                        const SizedBox(height: 12),
+                        _errorBanner(),
+                      ],
+                      const SizedBox(height: 16),
+                      if (d == null)
+                        _welcome()
+                      else ...[
+                        _hero(d),
+                        const SizedBox(height: 14),
+                        _hourly(d),
+                        const SizedBox(height: 14),
+                        _details(d),
+                        const SizedBox(height: 14),
+                        _weekly(d),
+                        const SizedBox(height: 16),
+                        Center(
+                          child: Text(
+                            'Forecast by Open-Meteo',
+                            style: TextStyle(
+                              color: muted.withValues(alpha: .7),
+                              fontSize: 11,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ]),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (loading)
+            const Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: LinearProgressIndicator(
+                minHeight: 2,
+                color: sky,
+                backgroundColor: Colors.transparent,
+              ),
+            ),
+        ],
+      ),
+      floatingActionButton: _vaultCode == null
+          ? FloatingActionButton.small(
+              onPressed: _openVault,
+              backgroundColor: panelLight,
+              foregroundColor: sky,
+              tooltip: 'Set up your private vault',
+              child: const Icon(Icons.lock_open_rounded),
             )
-            self._animate_chart_marker()
-        for i, h in enumerate(d["hourly"]):
-            self.hourly_row.grid_columnconfigure(i, weight=1, uniform="h")
-            col = ctk.CTkFrame(self.hourly_row, fg_color="transparent")
-            col.grid(row=1, column=i, sticky="nsew")
-            when = "Now" if i == 0 else datetime.fromisoformat(h["time"]).strftime("%I %p").lstrip("0")
-            ctk.CTkLabel(col, text=when, font=font(12), text_color=MUTED).pack(pady=(2, 4))
-            ctk.CTkLabel(col, text=describe(h["code"], h["is_day"])[2], font=font(24)).pack()
-            ctk.CTkLabel(col, text=f"{round(h['temp'])}°", font=font(16, "bold")).pack(pady=(4, 0))
-            chance = h.get("precip")
-            ctk.CTkLabel(col, text="—" if chance is None else f"{chance}%", font=font(10),
-                         text_color="#A9D5FF" if chance and chance >= 20 else MUTED).pack(pady=(1, 0))
-            rainbar = tk.Canvas(col, width=42, height=4, bg=mix(self.bg, WHITE, 0.26), highlightthickness=0, bd=0)
-            rainbar.pack(pady=(1, 4))
-            self._canv_card.append(rainbar)
-            if chance:
-                rainbar.create_line(1, 2, 1 + 40 * chance / 100, 2, fill="#75C5FF", width=4, capstyle="round")
+          : null,
+    );
+  }
 
-    def _animate_chart_marker(self):
-        if not self._chart_canvas or not self._chart_points or not self._chart_marker:
-            return
-        try:
-            x, y = self._chart_points[self._chart_index]
-            outer, inner = self._chart_marker
-            self._chart_canvas.coords(outer, x-7, y-7, x+7, y+7)
-            self._chart_canvas.coords(inner, x-2, y-2, x+2, y+2)
-            self._chart_index = (self._chart_index + 1) % len(self._chart_points)
-            self._chart_anim_job = self.after(260, self._animate_chart_marker)
-        except tk.TclError:
-            self._chart_anim_job = None
+  Widget _topBar() => Row(
+    children: [
+      Container(
+        width: 42,
+        height: 42,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(14),
+          gradient: const LinearGradient(
+            colors: [Color(0xff4d93ee), Color(0xff6bdbd2)],
+          ),
+        ),
+        child: const Icon(Icons.wb_twilight_rounded, color: Colors.white),
+      ),
+      const SizedBox(width: 12),
+      const Expanded(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'SKYLINE',
+              style: TextStyle(
+                fontSize: 12,
+                letterSpacing: 2.3,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+            Text(
+              'Weather, in focus',
+              style: TextStyle(color: muted, fontSize: 11),
+            ),
+          ],
+        ),
+      ),
+      _unitToggle(),
+    ],
+  );
 
-    def _build_daily_rows(self, d):
-        for ch in self.daily_body.winfo_children():
-            ch.destroy()
-        week_lo = min(x["lo"] for x in d["daily"])
-        week_hi = max(x["hi"] for x in d["daily"])
-        span = max(week_hi - week_lo, 1)
-        W_BAR = 90
-        track = mix(self.bg, WHITE, 0.30)
-        for i, day in enumerate(d["daily"]):
-            self.daily_body.grid_rowconfigure(i, weight=1)
-            row = ctk.CTkFrame(self.daily_body, fg_color="transparent")
-            row.grid(row=i, column=0, sticky="nsew")
-            row.grid_columnconfigure(0, minsize=64)
-            row.grid_columnconfigure(3, weight=1)
-            name = "Today" if i == 0 else datetime.strptime(day["date"], "%Y-%m-%d").strftime("%a")
-            ctk.CTkLabel(row, text=name, font=font(14, "bold"), anchor="w").grid(row=0, column=0, sticky="w", padx=(6, 0))
-            ctk.CTkLabel(row, text=describe(day["code"])[2], font=font(18)).grid(row=0, column=1, padx=6)
-            ctk.CTkLabel(row, text=f"{round(day['lo'])}°", font=font(14), text_color=MUTED, width=36, anchor="e").grid(row=0, column=2)
-            bar = tk.Canvas(row, width=W_BAR, height=10, bg=mix(self.bg, WHITE, 0.14), highlightthickness=0, bd=0)
-            bar.grid(row=0, column=3, padx=8)
-            self._canv_card.append(bar)
-            x1 = 5 + (day["lo"] - week_lo) / span * (W_BAR - 10)
-            x2 = max(x1 + 1, 5 + (day["hi"] - week_lo) / span * (W_BAR - 10))
-            bar.create_line(5, 5, W_BAR - 5, 5, fill=track, width=6, capstyle="round")
-            bar.create_line(x1, 5, x2, 5, fill="#FBBF24", width=6, capstyle="round")
-            ctk.CTkLabel(row, text=f"{round(day['hi'])}°", font=font(14, "bold"), width=36, anchor="w").grid(row=0, column=4, padx=(0, 6))
+  Widget _unitToggle() => Container(
+    padding: const EdgeInsets.all(3),
+    decoration: BoxDecoration(
+      color: panel,
+      borderRadius: BorderRadius.circular(16),
+      border: Border.all(color: Colors.white.withValues(alpha: .07)),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _unitButton('°C', !imperial, () => _changeUnits(false)),
+        _unitButton('°F', imperial, () => _changeUnits(true)),
+      ],
+    ),
+  );
+  Widget _unitButton(String label, bool active, VoidCallback tap) =>
+      GestureDetector(
+        onTap: tap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
+          decoration: BoxDecoration(
+            color: active ? const Color(0xff2b4b6c) : Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontWeight: FontWeight.w700,
+              fontSize: 12,
+              color: active ? Colors.white : muted,
+            ),
+          ),
+        ),
+      );
 
+  Widget _searchArea() => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Row(
+        children: [
+          Expanded(
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 220),
+              height: 52,
+              decoration: BoxDecoration(
+                color: focus.hasFocus ? const Color(0xff182b44) : panel,
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(
+                  color: focus.hasFocus
+                      ? sky.withValues(alpha: .48)
+                      : Colors.white.withValues(alpha: .08),
+                ),
+                boxShadow: focus.hasFocus
+                    ? [
+                        BoxShadow(
+                          color: sky.withValues(alpha: .08),
+                          blurRadius: 18,
+                          spreadRadius: 1,
+                        ),
+                      ]
+                    : const [],
+              ),
+              child: Row(
+                children: [
+                  const SizedBox(width: 14),
+                  const Icon(Icons.search_rounded, color: muted, size: 20),
+                  const SizedBox(width: 7),
+                  Expanded(
+                    child: TextField(
+                      controller: searchController,
+                      focusNode: focus,
+                      onChanged: _onQuery,
+                      onSubmitted: (_) => _search(),
+                      textInputAction: TextInputAction.search,
+                      obscureText: _isVaultCodeDraft,
+                      enableSuggestions: !_isVaultCodeDraft,
+                      autocorrect: false,
+                      keyboardType: _isVaultCodeDraft
+                          ? TextInputType.visiblePassword
+                          : TextInputType.text,
+                      decoration: const InputDecoration(
+                        hintText: 'Search city or region',
+                        hintStyle: TextStyle(
+                          color: Color(0xff8294aa),
+                          fontSize: 14,
+                        ),
+                        border: InputBorder.none,
+                        isDense: true,
+                      ),
+                    ),
+                  ),
+                  if (searchController.text.isNotEmpty)
+                    IconButton(
+                      onPressed: () {
+                        searchController.clear();
+                        setState(() => suggestions.clear());
+                      },
+                      icon: const Icon(
+                        Icons.close_rounded,
+                        size: 18,
+                        color: muted,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 9),
+          _iconAction(Icons.near_me_rounded, 'Use my location', _locate),
+          const SizedBox(width: 8),
+          SizedBox(
+            height: 52,
+            child: FilledButton(
+              onPressed: _search,
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xff3c7dcc),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(17),
+                ),
+                padding: const EdgeInsets.symmetric(horizontal: 17),
+              ),
+              child: const Text(
+                'Go',
+                style: TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+          ),
+        ],
+      ),
+      if (place != null && suggestions.isEmpty)
+        Padding(
+          padding: const EdgeInsets.only(left: 4, top: 10),
+          child: Row(
+            children: [
+              const Icon(Icons.place_rounded, color: mint, size: 14),
+              const SizedBox(width: 5),
+              Expanded(
+                child: Text(
+                  place!.label,
+                  style: const TextStyle(color: muted, fontSize: 12),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+    ],
+  );
+  Widget _iconAction(IconData icon, String label, VoidCallback tap) => Tooltip(
+    message: label,
+    child: SizedBox(
+      width: 50,
+      height: 52,
+      child: Material(
+        color: panelLight,
+        borderRadius: BorderRadius.circular(17),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(17),
+          onTap: tap,
+          child: Icon(icon, color: mint, size: 20),
+        ),
+      ),
+    ),
+  );
 
-# ----------------------------------------------------------------------------
-# VAULT VIEW (managed file and folder copies)
-# ----------------------------------------------------------------------------
-class ModalDialog(ctk.CTkToplevel):
-    def __init__(self, master, title, size):
-        super().__init__(master, fg_color=V_BG)
-        self.title(title)
-        self.geometry(size)
-        self.resizable(False, False)
-        self.transient(master.winfo_toplevel())
-        self.after(100, self._grab)
+  Widget _suggestionPanel() => Container(
+    decoration: BoxDecoration(
+      color: const Color(0xff15263c),
+      borderRadius: BorderRadius.circular(17),
+      border: Border.all(color: Colors.white.withValues(alpha: .08)),
+    ),
+    child: Column(
+      children: [
+        for (var i = 0; i < suggestions.length; i++)
+          Column(
+            children: [
+              InkWell(
+                onTap: () => _select(suggestions[i]),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 11,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        i == 0
+                            ? Icons.location_on_rounded
+                            : Icons.location_city_rounded,
+                        color: i == 0 ? mint : sky,
+                        size: 18,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              suggestions[i].name,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            Text(
+                              [
+                                suggestions[i].region,
+                                suggestions[i].country,
+                              ].where((x) => x.isNotEmpty).join(', '),
+                              style: const TextStyle(
+                                color: muted,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const Icon(
+                        Icons.north_west_rounded,
+                        size: 15,
+                        color: muted,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              if (i != suggestions.length - 1)
+                Divider(
+                  height: 1,
+                  indent: 42,
+                  color: Colors.white.withValues(alpha: .06),
+                ),
+            ],
+          ),
+      ],
+    ),
+  );
 
-    def _grab(self):
-        try:
-            self.grab_set()
-            self.focus_force()
-        except tk.TclError:
-            pass
+  Widget _errorBanner() => Container(
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: const Color(0xff472b37),
+      borderRadius: BorderRadius.circular(14),
+    ),
+    child: Row(
+      children: [
+        const Icon(
+          Icons.info_outline_rounded,
+          color: Color(0xffffb8a4),
+          size: 18,
+        ),
+        const SizedBox(width: 9),
+        Expanded(
+          child: Text(
+            error!,
+            style: const TextStyle(color: Color(0xffffd5c9), fontSize: 12),
+          ),
+        ),
+        IconButton(
+          onPressed: () => place == null ? _search() : _load(place!),
+          icon: const Icon(Icons.refresh_rounded, size: 18),
+          visualDensity: VisualDensity.compact,
+        ),
+      ],
+    ),
+  );
 
+  Widget _welcome() => FadeTransition(
+    opacity: entrance,
+    child: Container(
+      height: 420,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(30),
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xff15314d), Color(0xff101c31)],
+        ),
+        border: Border.all(color: Colors.white.withValues(alpha: .08)),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          SizedBox(
+            height: 180,
+            child: AnimatedBuilder(
+              animation: float,
+              builder: (_, _) => RepaintBoundary(
+                child: CustomPaint(
+                  painter: WeatherPainter('partly', true, float.value),
+                  size: const Size(220, 180),
+                ),
+              ),
+            ),
+          ),
+          const Text(
+            'A little more sky.',
+            style: TextStyle(fontWeight: FontWeight.w700, fontSize: 23),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Search a city to see the forecast\nfor the hours and days ahead.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: muted, height: 1.55),
+          ),
+          const SizedBox(height: 22),
+          const Icon(Icons.keyboard_arrow_up_rounded, color: sky),
+        ],
+      ),
+    ),
+  );
 
-class EditDialog(ModalDialog):
-    def __init__(self, master, entry, on_save):
-        super().__init__(master, "Edit item", "480x470")
-        self.on_save = on_save
-        ctk.CTkLabel(self, text="Edit saved location", font=font(20, "bold"), text_color=V_TEXT).pack(anchor="w", padx=24, pady=(22, 2))
-        ctk.CTkLabel(self, text=entry["path"], font=font(11), text_color=V_MUTED, wraplength=430, justify="left").pack(anchor="w", padx=24)
-        self.name = self._field("Display name", entry["name"])
-        self.tags = self._field("Tags (comma-separated)", entry.get("tags", ""))
-        ctk.CTkLabel(self, text="Notes", font=font(12), text_color=V_MUTED).pack(anchor="w", padx=24, pady=(12, 2))
-        self.note = ctk.CTkTextbox(self, height=100, fg_color=V_CARD, border_width=1, border_color=V_LINE)
-        self.note.pack(fill="x", padx=24)
-        self.note.insert("1.0", entry.get("note", ""))
-        btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.pack(fill="x", padx=24, pady=18)
-        ctk.CTkButton(btns, text="Save", width=110, command=self._save).pack(side="right")
-        ctk.CTkButton(btns, text="Cancel", width=90, fg_color="transparent", border_width=1, border_color=V_LINE,
-                      command=self.destroy).pack(side="right", padx=8)
+  Widget _hero(WeatherData d) => FadeTransition(
+    opacity: entrance,
+    child: Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(28),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: d.isDay
+              ? const [Color(0xff1c4264), Color(0xff162841), Color(0xff14243a)]
+              : const [Color(0xff1c2b52), Color(0xff16213b), Color(0xff121c31)],
+        ),
+        border: Border.all(color: Colors.white.withValues(alpha: .1)),
+        boxShadow: [
+          BoxShadow(
+            color: sky.withValues(alpha: .08),
+            blurRadius: 35,
+            offset: const Offset(0, 16),
+          ),
+        ],
+      ),
+      child: Stack(
+        children: [
+          Positioned(
+            right: -38,
+            top: -35,
+            child: Container(
+              width: 190,
+              height: 190,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: sky.withValues(alpha: .04),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 18, 20, 17),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.place_rounded, color: mint, size: 16),
+                    const SizedBox(width: 5),
+                    Expanded(
+                      child: Text(
+                        place?.name ?? 'Weather',
+                        style: const TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w700,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    Text(
+                      '${d.high}° / ${d.low}°',
+                      style: const TextStyle(color: muted, fontSize: 12),
+                    ),
+                  ],
+                ),
+                Text(
+                  [
+                    place?.region,
+                    place?.country,
+                  ].whereType<String>().where((e) => e.isNotEmpty).join(' · '),
+                  style: const TextStyle(color: muted, fontSize: 11),
+                ),
+                const SizedBox(height: 5),
+                SizedBox(
+                  height: 174,
+                  child: Row(
+                    children: [
+                      Expanded(
+                        flex: 5,
+                        child: AnimatedBuilder(
+                          animation: float,
+                          builder: (_, _) => RepaintBoundary(
+                            child: CustomPaint(
+                              painter: WeatherPainter(
+                                d.kind,
+                                d.isDay,
+                                float.value,
+                              ),
+                              size: const Size(190, 174),
+                            ),
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        flex: 4,
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            AnimatedSwitcher(
+                              duration: const Duration(milliseconds: 450),
+                              transitionBuilder: (child, a) => FadeTransition(
+                                opacity: a,
+                                child: SlideTransition(
+                                  position: Tween(
+                                    begin: const Offset(0, .12),
+                                    end: Offset.zero,
+                                  ).animate(a),
+                                  child: child,
+                                ),
+                              ),
+                              child: Text(
+                                '${d.temp}°',
+                                key: ValueKey(d.temp),
+                                style: const TextStyle(
+                                  fontSize: 63,
+                                  fontWeight: FontWeight.w300,
+                                  letterSpacing: -4,
+                                  height: 1,
+                                ),
+                              ),
+                            ),
+                            Text(
+                              d.condition,
+                              style: const TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'Feels like ${d.feels}°',
+                              style: const TextStyle(
+                                color: muted,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(color: Color(0x22ffffff), height: 14),
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.wb_sunny_outlined,
+                      color: Color(0xffffd27a),
+                      size: 16,
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        'H ${d.high}°  ·  L ${d.low}°',
+                        style: const TextStyle(color: muted, fontSize: 11),
+                      ),
+                    ),
+                    Text(
+                      'Updated ${_time(d.current['time'] as String?)}',
+                      style: const TextStyle(color: muted, fontSize: 10),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
 
-    def _field(self, label, value):
-        ctk.CTkLabel(self, text=label, font=font(12), text_color=V_MUTED).pack(anchor="w", padx=24, pady=(12, 2))
-        e = ctk.CTkEntry(self, height=36, fg_color=V_CARD, border_color=V_LINE)
-        e.pack(fill="x", padx=24)
-        e.insert(0, value)
-        return e
+  String _time(String? iso) {
+    final t = iso == null ? null : DateTime.tryParse(iso);
+    if (t == null) return 'now';
+    final h = t.hour % 12 == 0 ? 12 : t.hour % 12;
+    return '$h:${t.minute.toString().padLeft(2, '0')} ${t.hour < 12 ? 'AM' : 'PM'}';
+  }
 
-    def _save(self):
-        name = self.name.get().strip()
-        if not name:
-            return
-        self.on_save(name=name, tags=self.tags.get().strip(), note=self.note.get("1.0", "end").strip())
-        self.destroy()
+  Widget _sectionCard({
+    required String title,
+    required Widget child,
+    Widget? trailing,
+  }) => Container(
+    padding: const EdgeInsets.fromLTRB(16, 15, 16, 14),
+    decoration: BoxDecoration(
+      color: panel.withValues(alpha: .93),
+      borderRadius: BorderRadius.circular(23),
+      border: Border.all(color: Colors.white.withValues(alpha: .065)),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                title.toUpperCase(),
+                style: const TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1.3,
+                  color: muted,
+                ),
+              ),
+            ),
+            ?trailing,
+          ],
+        ),
+        const SizedBox(height: 12),
+        child,
+      ],
+    ),
+  );
 
+  Widget _hourly(WeatherData d) {
+    final times = d.hourly['time'] as List;
+    final temps = d.hourly['temperature_2m'] as List;
+    final rains = d.hourly['precipitation_probability'] as List;
+    final codes = d.hourly['weather_code'] as List;
+    final now = DateTime.tryParse(d.current['time'] as String? ?? '');
+    var start = 0;
+    if (now != null) {
+      final idx = times.indexWhere(
+        (v) =>
+            DateTime.tryParse(
+              v,
+            )?.isAfter(now.subtract(const Duration(hours: 1))) ??
+            false,
+      );
+      if (idx >= 0) start = idx;
+    }
+    final count = math.min(12, times.length - start);
+    final values = List<double>.generate(
+      count,
+      (i) => (temps[start + i] as num).toDouble(),
+    );
+    return _sectionCard(
+      title: 'Next hours',
+      trailing: const Text(
+        'TEMP · RAIN',
+        style: TextStyle(color: muted, fontSize: 9, letterSpacing: .5),
+      ),
+      child: Column(
+        children: [
+          SizedBox(
+            height: 68,
+            child: RepaintBoundary(
+              child: CustomPaint(
+                painter: TrendPainter(values, float.value),
+                child: const SizedBox.expand(),
+              ),
+            ),
+          ),
+          const SizedBox(height: 4),
+          SizedBox(
+            height: 86,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              physics: const BouncingScrollPhysics(),
+              itemCount: count,
+              separatorBuilder: (_, _) => const SizedBox(width: 12),
+              itemBuilder: (_, i) {
+                final k = start + i;
+                final kind = conditionKind((codes[k] as num).toInt());
+                final rain = rains[k] as num?;
+                return SizedBox(
+                  width: 43,
+                  child: Column(
+                    children: [
+                      Text(
+                        _hourLabel(times[k] as String, i),
+                        style: const TextStyle(color: muted, fontSize: 9),
+                      ),
+                      const SizedBox(height: 5),
+                      Icon(weatherIcon(kind), color: sky, size: 19),
+                      const SizedBox(height: 4),
+                      Text(
+                        '${(temps[k] as num).round()}°',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        rain == null ? '–' : '${rain.round()}%',
+                        style: TextStyle(
+                          color: (rain ?? 0) >= 30 ? sky : muted,
+                          fontSize: 9,
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
-class ChangePinDialog(ModalDialog):
-    def __init__(self, master, on_save):
-        super().__init__(master, "Change access code", "420x400")
-        self.on_save = on_save
-        ctk.CTkLabel(self, text="Change access code", font=font(20, "bold"), text_color=V_TEXT).pack(pady=(24, 4))
-        ctk.CTkLabel(self, text="The vault is re-encrypted with your new code.", font=font(12), text_color=V_MUTED).pack()
-        self.fields = PinFields(self, width=320)
-        self.fields.pack(pady=18)
-        self.err = ctk.CTkLabel(self, text="", text_color="#FF8A8A", font=font(12))
-        self.err.pack()
-        ctk.CTkButton(self, text="Update code", width=320, height=40, command=self._apply).pack(pady=10)
+  Widget _details(WeatherData d) => Row(
+    children: [
+      _metric(
+        'FEELS LIKE',
+        '${d.feels}°',
+        Icons.thermostat_rounded,
+        const Color(0xffffbd82),
+      ),
+      const SizedBox(width: 8),
+      _metric('HUMIDITY', '${d.humidity}%', Icons.water_drop_rounded, sky),
+      const SizedBox(width: 8),
+      _metric(
+        'WIND',
+        '${d.wind} ${imperial ? 'mph' : 'km/h'}',
+        Icons.air_rounded,
+        mint,
+      ),
+      const SizedBox(width: 8),
+      _metric(
+        'UV INDEX',
+        '${d.uv}',
+        Icons.wb_sunny_rounded,
+        const Color(0xffffd27a),
+      ),
+    ],
+  );
+  Widget _metric(String title, String value, IconData icon, Color color) =>
+      Expanded(
+        child: Container(
+          height: 96,
+          padding: const EdgeInsets.fromLTRB(9, 11, 5, 8),
+          decoration: BoxDecoration(
+            color: panel,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: Colors.white.withValues(alpha: .06)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(icon, color: color, size: 16),
+              const Spacer(),
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(
+                  value,
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 1),
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(
+                  title,
+                  style: const TextStyle(
+                    color: muted,
+                    fontSize: 8,
+                    letterSpacing: .4,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
 
-    def _apply(self):
-        pin, conf = self.fields.get()
-        err = validate_pin(pin, conf)
-        if err:
-            self.err.configure(text=err)
-            return
-        self.on_save(pin)
-        self.destroy()
+  Widget _weekly(WeatherData d) {
+    final dates = d.daily['time'] as List,
+        codes = d.daily['weather_code'] as List,
+        lows = d.daily['temperature_2m_min'] as List,
+        highs = d.daily['temperature_2m_max'] as List;
+    final min = (lows.cast<num>().reduce(math.min)).toDouble(),
+        max = (highs.cast<num>().reduce(math.max)).toDouble(),
+        span = math.max(1, max - min).toDouble();
+    return _sectionCard(
+      title: '7-day outlook',
+      child: Column(
+        children: [
+          for (var i = 0; i < dates.length; i++)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 5),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 48,
+                    child: Text(
+                      _dayLabel(dates[i] as String, i),
+                      style: TextStyle(
+                        color: i == 0 ? Colors.white : muted,
+                        fontSize: 11,
+                        fontWeight: i == 0 ? FontWeight.w700 : FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                  Icon(
+                    weatherIcon(conditionKind((codes[i] as num).toInt())),
+                    size: 17,
+                    color: sky,
+                  ),
+                  const SizedBox(width: 10),
+                  SizedBox(
+                    width: 30,
+                    child: Text(
+                      '${(lows[i] as num).round()}°',
+                      textAlign: TextAlign.right,
+                      style: const TextStyle(color: muted, fontSize: 11),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _RangeBar(
+                      low: (lows[i] as num).toDouble(),
+                      high: (highs[i] as num).toDouble(),
+                      min: min,
+                      span: span,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  SizedBox(
+                    width: 30,
+                    child: Text(
+                      '${(highs[i] as num).round()}°',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 
+  Future<void> _openVault({String? initialCode}) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => VaultSheet(initialCode: initialCode),
+    );
+    final code = await const FlutterSecureStorage().read(key: 'vault_code');
+    if (mounted && code != _vaultCode) setState(() => _vaultCode = code);
+  }
+}
 
-class VaultView(ctk.CTkFrame):
-    COLS = ("name", "path", "added", "notes", "status")
-    HEAD = {"name": "Name", "path": "Location", "added": "Date added", "notes": "Tags / Notes", "status": "Status"}
+class _Backdrop extends StatelessWidget {
+  const _Backdrop();
+  @override
+  Widget build(BuildContext context) => Stack(
+    fit: StackFit.expand,
+    children: [
+      const DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Color(0xff10213a), ink, Color(0xff0a1424)],
+          ),
+        ),
+      ),
+      Positioned(
+        top: -150,
+        right: -105,
+        child: _ambientGlow(350, const [Color(0x264b91ec), Color(0x004b91ec)]),
+      ),
+      Positioned(
+        bottom: 70,
+        left: -190,
+        child: _ambientGlow(330, const [Color(0x1d36bcae), Color(0x0036bcae)]),
+      ),
+      Positioned.fill(
+        child: IgnorePointer(child: CustomPaint(painter: _AtmospherePainter())),
+      ),
+    ],
+  );
 
-    def __init__(self, app, vault: Vault):
-        super().__init__(app, fg_color=V_BG, corner_radius=0)
-        self.app, self.vault = app, vault
-        self.sort_col, self.sort_rev = "added", True
+  Widget _ambientGlow(double size, List<Color> colors) => Container(
+    width: size,
+    height: size,
+    decoration: BoxDecoration(
+      shape: BoxShape.circle,
+      gradient: RadialGradient(colors: colors),
+    ),
+  );
+}
 
-        # header
-        head = ctk.CTkFrame(self, fg_color="transparent")
-        head.pack(fill="x", padx=28, pady=(24, 6))
-        titles = ctk.CTkFrame(head, fg_color="transparent")
-        titles.pack(side="left")
-        ctk.CTkLabel(titles, text="🔐  Private Vault", font=font(26, "bold"), text_color=V_TEXT).pack(anchor="w")
-        ctk.CTkLabel(titles, text="Real local copies are saved in app storage; vault metadata is encrypted.",
-                     font=font(12), text_color=V_MUTED).pack(anchor="w")
-        ctk.CTkButton(head, text="🔒  Lock & Return to Weather", height=44, width=230, corner_radius=22,
-                      fg_color=V_DANGER, hover_color="#C93A3F", font=font(14, "bold"), command=app.lock_vault).pack(side="right")
-        ctk.CTkButton(head, text="Erase all", width=84, height=34, fg_color="transparent", border_width=1,
-                      border_color=V_LINE, text_color=V_MUTED, hover_color=V_CARD, command=self._erase_all).pack(side="right", padx=(0, 12))
-        ctk.CTkButton(head, text="Change code", width=104, height=34, fg_color="transparent", border_width=1,
-                      border_color=V_LINE, text_color=V_MUTED, hover_color=V_CARD, command=self._change_pin).pack(side="right", padx=(0, 8))
+class _AtmospherePainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final points = <Offset>[
+      Offset(size.width * .14, size.height * .17),
+      Offset(size.width * .82, size.height * .27),
+      Offset(size.width * .73, size.height * .69),
+      Offset(size.width * .22, size.height * .82),
+      Offset(size.width * .91, size.height * .9),
+    ];
+    for (var i = 0; i < points.length; i++) {
+      final radius = i.isEven ? 1.4 : 1.0;
+      canvas.drawCircle(
+        points[i],
+        radius,
+        Paint()..color = Colors.white.withValues(alpha: .13),
+      );
+    }
+  }
 
-        # toolbar
-        bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.pack(fill="x", padx=28, pady=(14, 10))
-        for text, cmd, accent in [("＋ Import files", self._add_files, True), ("＋ Import folder", self._add_folder, True),
-                                  ("Create file", self._create_file, True), ("Create folder", self._create_folder, True),
-                                  ("Open", self._open_location, False), ("Edit", self._edit, False),
-                                  ("Remove", self._remove, False)]:
-            ctk.CTkButton(bar, text=text, height=36, width=102 if accent else 82, corner_radius=10, command=cmd,
-                          fg_color=V_ACCENT if accent else V_CARD, hover_color="#3A77E0" if accent else V_LINE,
-                          text_color=WHITE if accent else V_TEXT).pack(side="left", padx=(0, 8))
-        self.filter = ctk.CTkEntry(bar, placeholder_text="Filter…", width=160, height=36, fg_color=V_CARD, border_color=V_LINE)
-        self.filter.pack(side="right")
-        self.filter.bind("<KeyRelease>", lambda e: self.refresh())
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
 
-        # table
-        wrap = ctk.CTkFrame(self, fg_color=V_CARD, corner_radius=16, border_width=1, border_color=V_LINE)
-        wrap.pack(fill="both", expand=True, padx=28)
-        self._style_tree()
-        self.tree = ttk.Treeview(wrap, columns=self.COLS, show="headings", style="Vault.Treeview", selectmode="extended")
-        widths = {"name": 180, "path": 380, "added": 130, "notes": 200, "status": 90}
-        for c in self.COLS:
-            self.tree.heading(c, text=self.HEAD[c], anchor="w", command=lambda c=c: self._set_sort(c))
-            self.tree.column(c, width=widths[c], anchor="w", stretch=(c in ("path", "notes")), minwidth=70)
-        sb = ctk.CTkScrollbar(wrap, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y", padx=(0, 4), pady=8)
-        self.tree.pack(fill="both", expand=True, padx=(8, 0), pady=8)
-        self.tree.bind("<Double-1>", self._on_double)
-        self.empty = ctk.CTkLabel(wrap, text="No saved items yet.\nImport or create files and folders to keep real copies here.",
-                                  text_color=V_MUTED, font=font(14), justify="center")
+class _RangeBar extends StatelessWidget {
+  const _RangeBar({
+    required this.low,
+    required this.high,
+    required this.min,
+    required this.span,
+  });
+  final double low, high, min, span;
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    height: 21,
+    child: CustomPaint(
+      painter: _RangePainter((low - min) / span, (high - min) / span),
+    ),
+  );
+}
 
-        self.msg = ctk.CTkLabel(self, text="", font=font(12), text_color=V_MUTED, anchor="w")
-        self.msg.pack(fill="x", padx=30, pady=(8, 14))
-        self.refresh()
+class _RangePainter extends CustomPainter {
+  _RangePainter(this.a, this.b);
+  final double a, b;
+  @override
+  void paint(Canvas canvas, Size size) {
+    final y = size.height / 2;
+    final bg = Paint()
+      ..color = const Color(0xff33465b)
+      ..strokeWidth = 4
+      ..strokeCap = StrokeCap.round;
+    canvas.drawLine(Offset(0, y), Offset(size.width, y), bg);
+    final fg = Paint()
+      ..shader = const LinearGradient(
+        colors: [Color(0xff81d5d1), Color(0xffffc56e)],
+      ).createShader(Offset.zero & size)
+      ..strokeWidth = 4
+      ..strokeCap = StrokeCap.round;
+    canvas.drawLine(Offset(size.width * a, y), Offset(size.width * b, y), fg);
+  }
 
-    def _style_tree(self):
-        fam = tkfont.nametofont("TkDefaultFont").actual()["family"]
-        st = ttk.Style()
-        st.theme_use("clam")
-        st.layout("Vault.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
-        st.configure("Vault.Treeview", background=V_CARD, fieldbackground=V_CARD, foreground=V_TEXT,
-                     rowheight=36, borderwidth=0, font=(fam, 11))
-        st.configure("Vault.Treeview.Heading", background="#202636", foreground=V_MUTED, relief="flat",
-                     font=(fam, 10, "bold"), padding=(8, 8))
-        st.map("Vault.Treeview", background=[("selected", "#2B4A86")], foreground=[("selected", WHITE)])
-        st.map("Vault.Treeview.Heading", background=[("active", "#262C3E")])
+  @override
+  bool shouldRepaint(covariant _RangePainter old) => old.a != a || old.b != b;
+}
 
-    # ---- data -> table ----------------------------------------------------
-    def say(self, text):
-        self.msg.configure(text=text)
+class TrendPainter extends CustomPainter {
+  TrendPainter(this.values, this.phase);
+  final List<double> values;
+  final double phase;
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (values.length < 2 || size.width <= 0) return;
+    final lo = values.reduce((a, b) => a < b ? a : b),
+        hi = values.reduce((a, b) => a > b ? a : b),
+        span = math.max(1.0, hi - lo);
+    final pts = List<Offset>.generate(
+      values.length,
+      (i) => Offset(
+        5 + i * (size.width - 10) / (values.length - 1),
+        size.height - 9 - ((values[i] - lo) / span) * (size.height - 23),
+      ),
+    );
+    final path = Path()
+      ..moveTo(pts.first.dx, size.height)
+      ..lineTo(pts.first.dx, pts.first.dy);
+    for (var i = 1; i < pts.length; i++) {
+      path.cubicTo(
+        (pts[i - 1].dx + pts[i].dx) / 2,
+        pts[i - 1].dy,
+        (pts[i - 1].dx + pts[i].dx) / 2,
+        pts[i].dy,
+        pts[i].dx,
+        pts[i].dy,
+      );
+    }
+    path.lineTo(pts.last.dx, size.height);
+    path.close();
+    canvas.drawPath(
+      path,
+      Paint()
+        ..shader = const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0x4478bdff), Color(0x0078bdff)],
+        ).createShader(Offset.zero & size),
+    );
+    final line = Path()..moveTo(pts.first.dx, pts.first.dy);
+    for (var i = 1; i < pts.length; i++) {
+      line.cubicTo(
+        (pts[i - 1].dx + pts[i].dx) / 2,
+        pts[i - 1].dy,
+        (pts[i - 1].dx + pts[i].dx) / 2,
+        pts[i].dy,
+        pts[i].dx,
+        pts[i].dy,
+      );
+    }
+    canvas.drawPath(
+      line,
+      Paint()
+        ..color = const Color(0xff80c9ff)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.3
+        ..strokeCap = StrokeCap.round,
+    );
+    final cursor =
+        pts[(phase * (pts.length - 1)).round().clamp(0, pts.length - 1)];
+    canvas.drawCircle(cursor, 8, Paint()..color = sky.withValues(alpha: .16));
+    canvas.drawCircle(cursor, 3.5, Paint()..color = Colors.white);
+  }
 
-    def _set_sort(self, col):
-        self.sort_rev = not self.sort_rev if col == self.sort_col else False
-        self.sort_col = col
-        self.refresh()
+  @override
+  bool shouldRepaint(covariant TrendPainter old) =>
+      old.values != values || old.phase != phase;
+}
 
-    def refresh(self):
-        q = self.filter.get().strip().lower()
-        rows = []
-        for e in self.vault.entries:
-            notes = "  ".join(x for x in (e.get("tags", ""), e.get("note", "").replace("\n", " ")) if x)
-            if q and q not in f"{e['name']} {e['path']} {notes}".lower():
-                continue
-            status = "✓ Found" if os.path.exists(e["path"]) else "⚠ Missing"
-            rows.append((e["id"], (e["name"], e["path"], e["added"], notes, status)))
-        idx = self.COLS.index(self.sort_col)
-        rows.sort(key=lambda r: r[1][idx].lower(), reverse=self.sort_rev)
-        self.tree.delete(*self.tree.get_children())
-        for iid, vals in rows:
-            self.tree.insert("", "end", iid=iid, values=vals)
-        if self.vault.entries:
-            self.empty.place_forget()
-        else:
-            self.empty.place(relx=0.5, rely=0.5, anchor="center")
-        self.say(f"{len(rows)} of {len(self.vault.entries)} item(s)  ·  encrypted list · copies kept in saved_items")
+class WeatherPainter extends CustomPainter {
+  WeatherPainter(this.kind, this.day, this.phase);
+  final String kind;
+  final bool day;
+  final double phase;
+  @override
+  void paint(Canvas canvas, Size size) {
+    final s = math.min(size.width, size.height) / 170,
+        cx = size.width * .51,
+        cy = size.height * .52 + math.sin(phase * math.pi) * 3 * s;
+    final star = Paint()..color = Colors.white.withValues(alpha: .6);
+    if (!day) {
+      for (var i = 0; i < 10; i++) {
+        final x = (i * 47.0 + 9) % size.width,
+            y = (i * 29.0 + 15) % size.height;
+        canvas.drawCircle(
+          Offset(x, y),
+          (i % 3 + 1) * .65 * s,
+          star
+            ..color = Colors.white.withValues(
+              alpha: .25 + .25 * math.sin(phase * 2 + i).abs(),
+            ),
+        );
+      }
+    }
+    if (kind == 'clear' && day || kind == 'partly' && day) {
+      final radius = (25 + 1.5 * math.sin(phase * math.pi * 2)) * s;
+      canvas.drawCircle(
+        Offset(cx - 16 * s, cy - 19 * s),
+        radius + 14 * s,
+        Paint()..color = const Color(0xffffcf75).withValues(alpha: .07),
+      );
+      final glow = Paint()
+        ..shader =
+            RadialGradient(
+              colors: [
+                const Color(0xffffe7a0),
+                const Color(0xffffbb4b),
+                const Color(0xffffa13d).withValues(alpha: .1),
+              ],
+            ).createShader(
+              Rect.fromCircle(
+                center: Offset(cx - 16 * s, cy - 19 * s),
+                radius: radius,
+              ),
+            );
+      canvas.drawCircle(Offset(cx - 16 * s, cy - 19 * s), radius, glow);
+      for (var i = 0; i < 12; i++) {
+        final a = i * math.pi / 6 + phase * .12;
+        canvas.drawLine(
+          Offset(
+            cx - 16 * s + math.cos(a) * 32 * s,
+            cy - 19 * s + math.sin(a) * 32 * s,
+          ),
+          Offset(
+            cx - 16 * s + math.cos(a) * 39 * s,
+            cy - 19 * s + math.sin(a) * 39 * s,
+          ),
+          Paint()
+            ..color = const Color(0xffffd681)
+            ..strokeWidth = 2 * s
+            ..strokeCap = StrokeCap.round,
+        );
+      }
+      if (kind == 'clear') return;
+    }
+    final cloudCenter = Offset(
+      cx + (kind == 'partly' ? 11 : 0) * s,
+      cy + 15 * s,
+    );
+    final cloud = Paint()
+      ..shader =
+          const LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Color(0xfff6fbff), Color(0xff9db8d2)],
+          ).createShader(
+            Rect.fromCenter(
+              center: cloudCenter,
+              width: 100 * s,
+              height: 54 * s,
+            ),
+          );
+    final cloudShade = Paint()
+      ..color = const Color(0xff526f91).withValues(alpha: .42);
+    canvas.drawCircle(
+      cloudCenter.translate(-20 * s, 2 * s),
+      18 * s,
+      cloudShade,
+    );
+    canvas.drawCircle(cloudCenter.translate(2 * s, -9 * s), 25 * s, cloudShade);
+    canvas.drawCircle(cloudCenter.translate(25 * s, 2 * s), 17 * s, cloudShade);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromCenter(
+          center: cloudCenter.translate(3 * s, 12 * s),
+          width: 67 * s,
+          height: 26 * s,
+        ),
+        Radius.circular(12 * s),
+      ),
+      cloudShade,
+    );
+    canvas.drawCircle(cloudCenter.translate(-20 * s, -2 * s), 18 * s, cloud);
+    canvas.drawCircle(cloudCenter.translate(2 * s, -13 * s), 25 * s, cloud);
+    canvas.drawCircle(cloudCenter.translate(25 * s, -2 * s), 17 * s, cloud);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromCenter(
+          center: cloudCenter.translate(3 * s, 8 * s),
+          width: 67 * s,
+          height: 26 * s,
+        ),
+        Radius.circular(12 * s),
+      ),
+      cloud,
+    );
+    if (kind == 'rain' || kind == 'storm') {
+      for (var i = 0; i < 5; i++) {
+        final x = cx - 25 * s + i * 12 * s + math.sin(phase * 6 + i) * 2 * s,
+            y = cy + 29 * s + ((phase * 32 + i * 11) % 35) * s;
+        canvas.drawLine(
+          Offset(x, y),
+          Offset(x - 4 * s, y + 8 * s),
+          Paint()
+            ..color = sky.withValues(alpha: .8)
+            ..strokeWidth = 2 * s
+            ..strokeCap = StrokeCap.round,
+        );
+      }
+    }
+    if (kind == 'snow') {
+      for (var i = 0; i < 6; i++) {
+        final x = cx - 25 * s + i * 10 * s + math.sin(phase * 2 + i) * 3 * s,
+            y = cy + 32 * s + ((phase * 12 + i * 8) % 34) * s;
+        canvas.drawCircle(
+          Offset(x, y),
+          2 * s,
+          Paint()..color = Colors.white.withValues(alpha: .8),
+        );
+      }
+      if (kind == 'storm' && phase > .84) {
+        final lightning = Path()
+          ..moveTo(cx + 9 * s, cy + 19 * s)
+          ..lineTo(cx - 2 * s, cy + 38 * s)
+          ..lineTo(cx + 7 * s, cy + 38 * s)
+          ..lineTo(cx - 3 * s, cy + 54 * s);
+        canvas.drawPath(
+          lightning,
+          Paint()
+            ..color = const Color(0xffffd56a)
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 3 * s
+            ..strokeCap = StrokeCap.round,
+        );
+      }
+    }
+    if (kind == 'fog') {
+      for (var i = 0; i < 3; i++) {
+        final y = cy + 14 * s + i * 10 * s + math.sin(phase * 4 + i) * 2 * s;
+        canvas.drawLine(
+          Offset(cx - 38 * s, y),
+          Offset(cx + 38 * s, y),
+          Paint()
+            ..color = Colors.white.withValues(alpha: .6)
+            ..strokeWidth = 3 * s
+            ..strokeCap = StrokeCap.round,
+        );
+      }
+    }
+  }
 
-    def _selected(self) -> list[dict]:
-        return [e for e in (self.vault.get(i) for i in self.tree.selection()) if e]
+  @override
+  bool shouldRepaint(covariant WeatherPainter old) =>
+      old.kind != kind || old.day != day || old.phase != phase;
+}
 
-    # ---- actions ------------------------------------------------------------
-    def _import_paths(self, paths):
-        paths = list(paths)
-        if not paths:
-            return
-        self.say("Copying files into the app’s saved files folder…")
-        def work():
-            added, errors = 0, []
-            for path in paths:
-                try:
-                    added += bool(self.vault.import_path(path))
-                except Exception as exc:
-                    errors.append(f"{Path(path).name}: {exc}")
-            def done():
-                if not self.winfo_exists():
-                    return
-                self.refresh()
-                msg = f"Copied {added} item(s) into saved files."
-                if errors:
-                    msg += f" {len(errors)} could not be copied."
-                self.say(msg)
-                if errors:
-                    messagebox.showwarning("Some items were not copied", "\n".join(errors[:5]), parent=self)
-            self.after(0, done)
-        threading.Thread(target=work, daemon=True).start()
+String conditionName(int code) => switch (code) {
+  0 => 'Clear sky',
+  1 => 'Mainly clear',
+  2 => 'Partly cloudy',
+  3 => 'Overcast',
+  45 || 48 => 'Foggy',
+  51 || 53 || 55 => 'Drizzle',
+  56 || 57 => 'Freezing drizzle',
+  61 || 63 || 65 => 'Rain',
+  66 || 67 => 'Freezing rain',
+  71 || 73 || 75 || 77 => 'Snow',
+  80 || 81 || 82 => 'Rain showers',
+  85 || 86 => 'Snow showers',
+  95 => 'Thunderstorm',
+  96 || 99 => 'Thunderstorm with hail',
+  _ => 'Cloudy',
+};
+String conditionKind(int code) => switch (code) {
+  0 => 'clear',
+  1 || 2 => 'partly',
+  3 => 'cloudy',
+  45 || 48 => 'fog',
+  51 ||
+  53 ||
+  55 ||
+  56 ||
+  57 ||
+  61 ||
+  63 ||
+  65 ||
+  66 ||
+  67 ||
+  80 ||
+  81 ||
+  82 => 'rain',
+  71 || 73 || 75 || 77 || 85 || 86 => 'snow',
+  95 || 96 || 99 => 'storm',
+  _ => 'cloudy',
+};
+IconData weatherIcon(String kind) => switch (kind) {
+  'clear' => Icons.wb_sunny_rounded,
+  'partly' => Icons.wb_cloudy_rounded,
+  'rain' => Icons.grain_rounded,
+  'storm' => Icons.thunderstorm_rounded,
+  'snow' => Icons.ac_unit_rounded,
+  'fog' => Icons.foggy,
+  _ => Icons.cloud_rounded,
+};
 
-    def _add_files(self):
-        self._import_paths(filedialog.askopenfilenames(title="Choose files to copy into saved files"))
+class VaultSheet extends StatefulWidget {
+  const VaultSheet({super.key, this.initialCode});
+  final String? initialCode;
+  @override
+  State<VaultSheet> createState() => _VaultSheetState();
+}
 
-    def _add_folder(self):
-        p = filedialog.askdirectory(title="Choose a folder to copy into saved files")
-        if p:
-            self._import_paths([p])
+class _VaultSheetState extends State<VaultSheet> {
+  static const secure = FlutterSecureStorage();
+  static const privacyChannel = MethodChannel('skyline_weather/privacy');
+  final codeController = TextEditingController();
+  Directory? root;
+  bool unlocked = false, busy = false, authenticating = false;
+  List<FileSystemEntity> items = [];
+  String? message;
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
 
-    def _create_item(self, kind):
-        name = simpledialog.askstring(f"Create {kind}", f"Name for the new {kind}:", parent=self)
-        if not name:
-            return
-        name = name.strip()
-        if name in (".", "..") or Path(name).name != name or any(ch in name for ch in "\\/"):
-            messagebox.showerror("Invalid name", "Enter a simple name without folder separators.", parent=self)
-            return
-        if kind == "file" and not Path(name).suffix:
-            name += ".txt"
-        item_dir = SAVED_ITEMS_DIR / uuid.uuid4().hex[:12]
-        target = item_dir / name
-        try:
-            item_dir.mkdir(parents=True, exist_ok=False)
-            if kind == "folder":
-                target.mkdir()
-            else:
-                target.write_text("", encoding="utf-8")
-            self.vault.add_path(str(target))
-            self.refresh()
-            self.say(f"Created {target.name} in saved files.")
-        except FileExistsError:
-            messagebox.showerror("Already exists", f"{target.name} already exists.", parent=self)
-        except OSError as exc:
-            shutil.rmtree(item_dir, ignore_errors=True)
-            messagebox.showerror("Could not create item", str(exc), parent=self)
+  @override
+  void dispose() {
+    unawaited(_setWindowSecure(false));
+    codeController.dispose();
+    super.dispose();
+  }
 
-    def _create_file(self):
-        self._create_item("file")
+  Future<void> _setWindowSecure(bool enabled) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await privacyChannel.invokeMethod<void>('setSecure', {
+        'enabled': enabled,
+      });
+    } catch (_) {
+      // Keep the vault usable if the platform privacy control is unavailable.
+    }
+  }
 
-    def _create_folder(self):
-        self._create_item("folder")
+  Future<void> _lockVault() async {
+    await _setWindowSecure(false);
+    if (!mounted) return;
+    setState(() {
+      unlocked = false;
+      codeController.clear();
+      message = null;
+    });
+  }
 
-    def _open_location(self):
-        sel = self._selected()
-        if not sel:
-            self.say("Select an item first.")
-            return
-        try:
-            note = reveal_in_file_manager(sel[0]["path"])
-            self.say(note or "Opened in your file manager.")
-        except Exception as exc:
-            self.say(f"Couldn't open that location: {exc}")
+  Future<void> _init() async {
+    final dir = await getApplicationDocumentsDirectory();
+    root = Directory('${dir.path}/saved_items');
+    await root!.create(recursive: true);
+    if (mounted) {
+      setState(() {});
+      if (widget.initialCode != null) {
+        codeController.text = widget.initialCode!;
+        await _unlock();
+      }
+    }
+  }
 
-    def _on_double(self, event):
-        if self.tree.identify_row(event.y):
-            self._open_location()
+  Future<void> _unlock() async {
+    if (authenticating) return;
+    final code = codeController.text.trim();
+    if (code.isEmpty) {
+      setState(() => message = 'Enter your vault passcode.');
+      return;
+    }
+    setState(() => authenticating = true);
+    try {
+      final stored = await secure.read(key: 'vault_code');
+      if (!mounted) return;
+      if (stored == null) {
+        if (code.length < 8 || RegExp(r'^[a-zA-Z]').hasMatch(code)) {
+          setState(
+            () =>
+                message = 'Use 8+ characters starting with a number or symbol.',
+          );
+          return;
+        }
+        await secure.write(key: 'vault_code', value: code);
+        if (!mounted) return;
+        await _setWindowSecure(true);
+        if (!mounted) return;
+        codeController.clear();
+        setState(() {
+          unlocked = true;
+          message = null;
+        });
+        _refresh();
+        return;
+      }
 
-    def _edit(self):
-        sel = self._selected()
-        if not sel:
-            self.say("Select an item first.")
-            return
-        e = sel[0]
-        EditDialog(self, e, lambda **kw: (self.vault.update(e["id"], **kw), self.refresh(), self.say("Saved.")))
+      final lockUntil =
+          int.tryParse(await secure.read(key: 'vault_lockout_until') ?? '') ??
+          0;
+      if (!mounted) return;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (lockUntil > now) {
+        final seconds = ((lockUntil - now) / 1000).ceil();
+        setState(
+          () => message = 'Too many attempts. Try again in ${seconds}s.',
+        );
+        return;
+      }
 
-    def _remove(self):
-        sel = self._selected()
-        if not sel:
-            self.say("Select one or more items first.")
-            return
-        if messagebox.askyesno("Remove", f"Remove {len(sel)} saved item(s) and their copies from the app?", parent=self):
-            self.vault.remove([e["id"] for e in sel])
-            self.refresh()
+      if (stored == code) {
+        await secure.delete(key: 'vault_failed_attempts');
+        await secure.delete(key: 'vault_lockout_until');
+        if (!mounted) return;
+        await _setWindowSecure(true);
+        if (!mounted) return;
+        codeController.clear();
+        setState(() {
+          unlocked = true;
+          message = null;
+        });
+        _refresh();
+        return;
+      }
 
-    def _change_pin(self):
-        def apply(pin):
-            self.vault.rekey(self.app.security.set_pin(pin))
-            self.say("Access code updated and vault re-encrypted.")
-        ChangePinDialog(self, apply)
+      final attempts =
+          (int.tryParse(
+                await secure.read(key: 'vault_failed_attempts') ?? '',
+              ) ??
+              0) +
+          1;
+      if (!mounted) return;
+      if (attempts >= 5) {
+        final until = now + const Duration(seconds: 30).inMilliseconds;
+        await secure.write(key: 'vault_failed_attempts', value: '0');
+        await secure.write(key: 'vault_lockout_until', value: until.toString());
+        if (!mounted) return;
+        setState(() => message = 'Too many attempts. Try again in 30s.');
+      } else {
+        await secure.write(
+          key: 'vault_failed_attempts',
+          value: attempts.toString(),
+        );
+        if (!mounted) return;
+        setState(
+          () => message = 'Incorrect passcode. ${5 - attempts} attempts left.',
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => message = 'Secure storage is unavailable. Try again.');
+      }
+    } finally {
+      if (mounted) setState(() => authenticating = false);
+    }
+  }
 
-    def _erase_all(self):
-        if messagebox.askyesno("Erase everything",
-                               "This permanently deletes the vault AND your access code, then restarts setup.\nContinue?",
-                               icon="warning", parent=self):
-            self.app.factory_reset()
+  Future<void> _refresh() async {
+    final r = root;
+    if (r == null) return;
+    try {
+      final list = await r.list(followLinks: false).toList();
+      list.sort((a, b) => a.path.toLowerCase().compareTo(b.path.toLowerCase()));
+      if (mounted) setState(() => items = list);
+    } catch (_) {}
+  }
 
+  String _base(String path) => path.split(Platform.pathSeparator).last;
+  Future<void> _import() async {
+    try {
+      setState(() {
+        busy = true;
+        message = null;
+      });
+      final picked = await FilePicker.pickFiles();
+      if (root != null) {
+        for (final f in picked) {
+          final p = f.path;
+          if (p == null) continue;
+          final source = File(p);
+          final dest = File('${root!.path}/${_safe(_base(p))}');
+          await source.copy(await _uniquePath(dest.path));
+        }
+      }
+    } catch (e) {
+      message = 'Could not import: $e';
+    } finally {
+      if (mounted) {
+        setState(() => busy = false);
+        _refresh();
+      }
+    }
+  }
 
-# ----------------------------------------------------------------------------
-# APP SHELL
-# ----------------------------------------------------------------------------
-class App(ctk.CTk):
-    def __init__(self):
-        super().__init__()
-        ctk.set_appearance_mode("dark")
-        self.title("Weather")
-        self.geometry("1060x740")
-        self.minsize(920, 680)
-        self.configure(fg_color="#0E1633")
-        self.security = Security()
-        self.security.load()
-        self.weather: WeatherView | None = None
-        self.setup_view: SetupView | None = None
-        self.vault_view: VaultView | None = None
-        self.vault: Vault | None = None
-        self._idle_job = None
-        self._wiping = False
-        self._icon_ref = None
-        self.after(300, self._set_icon)
-        for ev in ("<Key>", "<Button>", "<Motion>"):
-            self.bind_all(ev, self._bump_idle, add="+")
-        self._show_weather() if self.security.configured else self._show_setup()
+  Future<void> _importFolder() async {
+    try {
+      setState(() {
+        busy = true;
+        message = null;
+      });
+      final path = await FilePicker.getDirectoryPath();
+      if (path != null && root != null) {
+        final source = Directory(path),
+            dest = Directory(
+              await _uniquePath('${root!.path}/${_safe(_base(path))}'),
+            );
+        await _copyDirectory(source, dest);
+      }
+    } catch (e) {
+      message = 'Could not import folder: $e';
+    } finally {
+      if (mounted) {
+        setState(() => busy = false);
+        _refresh();
+      }
+    }
+  }
 
-    def _set_icon(self):
-        if Image is None:
-            return
-        try:
-            img = Image.new("RGBA", (64, 64), (46, 123, 224, 255))
-            d = ImageDraw.Draw(img)
-            d.ellipse((30, 8, 56, 34), fill=(255, 212, 59, 255))
-            d.ellipse((6, 28, 30, 52), fill="white")
-            d.ellipse((18, 22, 44, 50), fill="white")
-            d.ellipse((34, 30, 58, 52), fill="white")
-            d.rectangle((16, 40, 48, 52), fill="white")
-            self._icon_ref = ImageTk.PhotoImage(img)
-            self.iconphoto(True, self._icon_ref)
-        except Exception:
-            pass
+  Future<String> _uniquePath(String path) async {
+    var candidate = path, i = 2;
+    while (await FileSystemEntity.type(candidate) !=
+        FileSystemEntityType.notFound) {
+      final dot = path.lastIndexOf('.'),
+          split = dot > path.lastIndexOf(Platform.pathSeparator)
+              ? dot
+              : path.length;
+      candidate = '${path.substring(0, split)} ($i)${path.substring(split)}';
+      i++;
+    }
+    return candidate;
+  }
 
-    # ---- screens ------------------------------------------------------------
-    def _show_setup(self):
-        self.setup_view = SetupView(self, self._after_setup)
-        self.setup_view.place(relx=0, rely=0, relwidth=1, relheight=1)
+  String _safe(String n) => n.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
+  Future<void> _copyDirectory(Directory from, Directory to) async {
+    await to.create(recursive: true);
+    await for (final entity in from.list(followLinks: false)) {
+      final dest = '${to.path}/${_safe(_base(entity.path))}';
+      if (entity is Directory) {
+        await _copyDirectory(entity, Directory(dest));
+      } else if (entity is File) {
+        await entity.copy(await _uniquePath(dest));
+      }
+    }
+  }
 
-    def _after_setup(self):
-        if self.setup_view:
-            self.setup_view.destroy()
-            self.setup_view = None
-        self._show_weather()
+  Future<void> _createFolder() async {
+    final name = await _askName('New folder', 'Folder name');
+    if (name == null || root == null) return;
+    await Directory('${root!.path}/${_safe(name)}').create(recursive: true);
+    await _refresh();
+  }
 
-    def _show_weather(self):
-        self.weather = WeatherView(self)
-        self.weather.place(relx=0, rely=0, relwidth=1, relheight=1)
-        self.weather.entry.focus_set()
+  Future<void> _createFile() async {
+    final name = await _askName(
+      'New text file',
+      'File name (example: notes.txt)',
+    );
+    if (name == null || root == null) return;
+    final fixed = name.contains('.') ? name : '$name.txt';
+    await File('${root!.path}/${_safe(fixed)}').writeAsString('');
+    await _refresh();
+  }
 
-    # ---- vault lifecycle ------------------------------------------------------
-    def try_unlock(self, text: str) -> bool:
-        key = self.security.check_pin(text)
-        if key is None:
-            return False
-        try:
-            vault = Vault(key)
-        except (InvalidToken, OSError, ValueError):
-            if self.weather:
-                self.weather.show_toast("Couldn't load data. Please try again.")
-            return True  # it was the right code; just don't expose vault internals
+  Future<String?> _askName(String title, String hint) async {
+    final c = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          controller: c,
+          autofocus: true,
+          decoration: InputDecoration(hintText: hint),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final v = c.text.trim();
+              Navigator.pop(ctx, v.isEmpty ? null : v);
+            },
+            child: const Text('Create'),
+          ),
+        ],
+      ),
+    );
+  }
 
-        def swap():
-            if self.weather:
-                self.weather.pause_background()
-            self.vault = vault
-            self.vault_view = VaultView(self, vault)
-            self.vault_view.place(relx=0, rely=0, relwidth=1, relheight=1)
-            self._bump_idle()
+  Future<void> _delete(FileSystemEntity e) async {
+    await e.delete(recursive: true);
+    _refresh();
+  }
 
-        self._wipe(swap, V_BG, "🔓")
-        return True
+  Future<void> _open(FileSystemEntity e) async {
+    if (e is Directory) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => VaultFolderPage(directory: e, onRefresh: _refresh),
+        ),
+      );
+      return;
+    }
+    if (e is File) {
+      if (e.path.toLowerCase().endsWith('.zip')) {
+        await _extractZip(e);
+      } else {
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: Text(_base(e.path)),
+            content: const Text(
+              'This item is safely stored in your app’s private vault folder. Use your device file picker to share or open it.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+        );
+      }
+    }
+  }
 
-    def lock_vault(self):
-        def swap():
-            self._teardown_vault()
-            if self.weather:
-                self.weather.resume_background()
-                self.weather.entry.delete(0, "end")
-                self.weather.focus_set()
+  Future<void> _extractZip(File zip) async {
+    try {
+      final bytes = await zip.readAsBytes();
+      final archive = ZipDecoder().decodeBytes(bytes);
+      final folder = Directory(
+        '${root!.path}/${_safe(_base(zip.path).replaceAll(RegExp(r'\.zip$', caseSensitive: false), ''))}',
+      );
+      await folder.create(recursive: true);
+      for (final entry in archive) {
+        final safe = entry.name.replaceAll('\\', '/');
+        if (safe.startsWith('/') ||
+            safe.split('/').any((part) => part == '..')) {
+          continue;
+        }
+        final dest = '${folder.path}/$safe';
+        if (entry.isFile) {
+          final f = File(dest);
+          await f.parent.create(recursive: true);
+          final contents = entry.readBytes();
+          if (contents != null) await f.writeAsBytes(contents);
+        } else {
+          await Directory(dest).create(recursive: true);
+        }
+      }
+      await _refresh();
+      setState(() => message = 'ZIP extracted into a real folder.');
+    } catch (e) {
+      setState(() => message = 'ZIP could not be extracted: $e');
+    }
+  }
 
-        self._wipe(swap, self.weather.bg if self.weather else "#0E1633", "🔒")
+  @override
+  Widget build(BuildContext context) => Container(
+    height: MediaQuery.sizeOf(context).height * .82,
+    padding: EdgeInsets.fromLTRB(
+      20,
+      12,
+      20,
+      MediaQuery.viewInsetsOf(context).bottom + 18,
+    ),
+    decoration: const BoxDecoration(
+      color: Color(0xff101d30),
+      borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+    ),
+    child: Column(
+      children: [
+        Container(
+          width: 38,
+          height: 4,
+          decoration: BoxDecoration(
+            color: Colors.white24,
+            borderRadius: BorderRadius.circular(9),
+          ),
+        ),
+        const SizedBox(height: 18),
+        Row(
+          children: [
+            const Icon(Icons.lock_rounded, color: mint),
+            const SizedBox(width: 9),
+            const Expanded(
+              child: Text(
+                'Private file vault',
+                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18),
+              ),
+            ),
+            if (unlocked)
+              IconButton(
+                onPressed: _lockVault,
+                icon: const Icon(Icons.lock_outline_rounded),
+                tooltip: 'Lock vault',
+              ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        const Text(
+          'Files and folders are copied into this app’s private storage.',
+          style: TextStyle(color: muted, fontSize: 12),
+        ),
+        const SizedBox(height: 15),
+        if (!unlocked) _unlockView() else Expanded(child: _vaultView()),
+        if (message != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(
+              message!,
+              style: const TextStyle(color: mint, fontSize: 11),
+            ),
+          ),
+        if (busy)
+          const Padding(
+            padding: EdgeInsets.only(top: 10),
+            child: LinearProgressIndicator(minHeight: 2),
+          ),
+      ],
+    ),
+  );
+  Widget _unlockView() => Column(
+    children: [
+      TextField(
+        controller: codeController,
+        obscureText: true,
+        enableSuggestions: false,
+        autocorrect: false,
+        keyboardType: TextInputType.visiblePassword,
+        decoration: InputDecoration(
+          labelText: 'Vault code',
+          prefixIcon: const Icon(Icons.key_rounded),
+          suffixIcon: IconButton(
+            onPressed: _unlock,
+            icon: const Icon(Icons.arrow_forward_rounded),
+          ),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(16)),
+        ),
+        onSubmitted: (_) => _unlock(),
+      ),
+      const SizedBox(height: 10),
+      const Text(
+        'Use 8+ characters beginning with a number or symbol. Keep it safe; it cannot be recovered.',
+        style: TextStyle(color: muted, fontSize: 11),
+      ),
+    ],
+  );
+  Widget _vaultView() => Column(
+    children: [
+      Wrap(
+        spacing: 7,
+        runSpacing: 7,
+        children: [
+          _action('Import files', Icons.upload_file_rounded, _import),
+          _action(
+            'Import folder',
+            Icons.drive_folder_upload_rounded,
+            _importFolder,
+          ),
+          _action('New folder', Icons.create_new_folder_rounded, _createFolder),
+          _action('New file', Icons.note_add_rounded, _createFile),
+        ],
+      ),
+      const SizedBox(height: 13),
+      Expanded(
+        child: items.isEmpty
+            ? const Center(
+                child: Text(
+                  'Your vault is empty. Add real files or create a folder.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: muted),
+                ),
+              )
+            : ListView.separated(
+                itemCount: items.length,
+                separatorBuilder: (_, _) =>
+                    const Divider(height: 1, color: Color(0x16ffffff)),
+                itemBuilder: (_, i) {
+                  final e = items[i], dir = e is Directory;
+                  return ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: CircleAvatar(
+                      backgroundColor: dir
+                          ? const Color(0xff263b56)
+                          : const Color(0xff243244),
+                      child: Icon(
+                        dir
+                            ? Icons.folder_rounded
+                            : Icons.insert_drive_file_rounded,
+                        color: dir ? const Color(0xffffce7a) : sky,
+                        size: 19,
+                      ),
+                    ),
+                    title: Text(
+                      _base(e.path),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    subtitle: Text(
+                      dir ? 'Folder' : _fileSize(e is File ? e : null),
+                      style: const TextStyle(color: muted, fontSize: 10),
+                    ),
+                    onTap: () => _open(e),
+                    trailing: IconButton(
+                      onPressed: () => _delete(e),
+                      icon: const Icon(
+                        Icons.delete_outline_rounded,
+                        color: muted,
+                        size: 20,
+                      ),
+                      tooltip: 'Delete',
+                    ),
+                  );
+                },
+              ),
+      ),
+    ],
+  );
+  String _fileSize(File? f) {
+    if (f == null) return 'File';
+    try {
+      final len = f.lengthSync();
+      return len > 1048576
+          ? '${(len / 1048576).toStringAsFixed(1)} MB'
+          : '${(len / 1024).ceil()} KB';
+    } catch (_) {
+      return 'File';
+    }
+  }
 
-    def _teardown_vault(self):
-        if self._idle_job:
-            self.after_cancel(self._idle_job)
-            self._idle_job = None
-        if self.vault_view:
-            self.vault_view.destroy()
-        self.vault_view, self.vault = None, None  # drop decrypted data + key from memory
+  Widget _action(String text, IconData icon, VoidCallback action) => ActionChip(
+    avatar: Icon(icon, size: 16, color: sky),
+    label: Text(text, style: const TextStyle(fontSize: 10)),
+    onPressed: busy ? null : action,
+    backgroundColor: panelLight,
+    side: BorderSide(color: Colors.white.withValues(alpha: .05)),
+  );
+}
 
-    def factory_reset(self):
-        for p in (CONFIG_PATH, VAULT_PATH):
-            try:
-                p.unlink()
-            except FileNotFoundError:
-                pass
-        self.security = Security()
+class VaultFolderPage extends StatefulWidget {
+  const VaultFolderPage({
+    super.key,
+    required this.directory,
+    required this.onRefresh,
+  });
+  final Directory directory;
+  final VoidCallback onRefresh;
+  @override
+  State<VaultFolderPage> createState() => _VaultFolderPageState();
+}
 
-        def swap():
-            self._teardown_vault()
-            if self.weather:
-                self.weather.destroy()
-                self.weather = None
-            self._show_setup()
+class _VaultFolderPageState extends State<VaultFolderPage> {
+  List<FileSystemEntity> children = [];
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
 
-        self._wipe(swap, "#0E1633", "♻️")
+  Future<void> _load() async {
+    try {
+      final list = await widget.directory.list().toList();
+      if (mounted) setState(() => children = list);
+    } catch (_) {}
+  }
 
-    def _bump_idle(self, event=None):
-        if self.vault_view is None:
-            return
-        if self._idle_job:
-            self.after_cancel(self._idle_job)
-        self._idle_job = self.after(IDLE_LOCK_MS, self.lock_vault)
-
-    # ---- transition: smooth screen wipe -------------------------------------
-    def _wipe(self, middle, color: str, glyph: str = ""):
-        if self._wiping:
-            return
-        self._wiping = True
-        ov = ctk.CTkFrame(self, fg_color=color, corner_radius=0)
-        ctk.CTkLabel(ov, text=glyph, font=font(54)).place(relx=0.5, rely=0.5, anchor="center")
-        steps = 12
-
-        def slide_in(i):
-            ov.place(relx=1 - ease(i / steps), rely=0, relwidth=1, relheight=1)
-            ov.lift()
-            if i < steps:
-                self.after(16, lambda: slide_in(i + 1))
-            else:
-                middle()
-                ov.lift()
-                self.after(120, lambda: slide_out(1))
-
-        def slide_out(i):
-            ov.place(relx=-ease(i / steps), rely=0, relwidth=1, relheight=1)
-            ov.lift()
-            if i < steps:
-                self.after(16, lambda: slide_out(i + 1))
-            else:
-                ov.destroy()
-                self._wiping = False
-
-        slide_in(1)
-
-
-def main():
-    App().mainloop()
-
-
-if __name__ == "__main__":
-    main()
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: ink,
+    appBar: AppBar(
+      title: Text(widget.directory.path.split(Platform.pathSeparator).last),
+      backgroundColor: ink,
+    ),
+    body: ListView.builder(
+      itemCount: children.length,
+      itemBuilder: (_, i) {
+        final e = children[i], dir = e is Directory;
+        return ListTile(
+          leading: Icon(
+            dir ? Icons.folder : Icons.insert_drive_file,
+            color: sky,
+          ),
+          title: Text(e.path.split(Platform.pathSeparator).last),
+          onTap: dir
+              ? () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => VaultFolderPage(
+                      directory: e,
+                      onRefresh: widget.onRefresh,
+                    ),
+                  ),
+                )
+              : null,
+          trailing: IconButton(
+            icon: const Icon(Icons.delete_outline_rounded),
+            onPressed: () async {
+              await e.delete(recursive: true);
+              await _load();
+              widget.onRefresh();
+            },
+          ),
+        );
+      },
+    ),
+  );
+}
