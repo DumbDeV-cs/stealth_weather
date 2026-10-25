@@ -1,5 +1,6 @@
-/assets/
+assets/
 outputs/
 src/__pycache__/
 work/
 __pycache__/
+.ignore

@@ -226,6 +226,7 @@ class _WeatherHomeState extends State<WeatherHome>
     }
     // A vault code is private input, not a city query. Avoid sending it to
     // geocoding while the user is typing it.
+    //we have to make sure this thing is safe.
     if (_vaultCode != null && _vaultCode!.startsWith(q) && q.isNotEmpty) {
       setState(() => suggestions.clear());
       return;
