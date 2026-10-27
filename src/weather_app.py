@@ -2374,4 +2374,5 @@ class _VaultFolderPageState extends State<VaultFolderPage> {
     ),
   );
 }
-"""ENJOY THIS APP"""
+"""ENJOY THIS APP
+Your feedback is appreciated"""
